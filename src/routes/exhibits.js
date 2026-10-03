@@ -85,6 +85,37 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     }
   }
 
+  // 共享照明归属（规则 19）：按驻留归属到本展品的实际用光；仅附加字段，既有消费者不受影响
+  const shared = require('../shared');
+  const sharedLights = (occupancy.sharedLights || []).map((sl) => ({
+    id: sl.id,
+    lightingId: sl.lightingId,
+    residencyId: sl.residencyId,
+    galleryId: sl.galleryId,
+    galleryCode: sl.galleryCode,
+    galleryName: sl.galleryName,
+    start: sl.start,
+    end: sl.end,
+    actualLux: sl.actualLux,
+    reason: sl.reason,
+    creatorName: sl.creatorName || null,
+    createdAt: sl.createdAt,
+    yearly: sl.yearly,
+    yearlyInside: sl.yearlyInside,
+    yearlyOutside: sl.yearlyOutside,
+    insidePlanIds: sl.insidePlanIds,
+  }));
+  const sharedLightDoseYearly = {};
+  for (const sl of sharedLights) {
+    for (const [y, d] of Object.entries(sl.yearly || {})) {
+      sharedLightDoseYearly[y] = Math.round(((sharedLightDoseYearly[y] || 0) + d) * 1000) / 1000;
+    }
+  }
+
+  // 驻留（陈列关系）：本展品全部驻留及“是否已被共享照明覆盖”标记
+  const residencyRows = await shared.listResidencies(client, { exhibitId });
+  const residencies = residencyRows.map(shared.serializeResidency);
+
   // 已封存年度账册（不可变）：附按当前数据重算的对照差额（仅附加字段，不影响既有消费者）
   const ledgerRows = await listSealedLedgers(client, exhibitId);
   const ledgers = [];
@@ -120,6 +151,9 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     blackoutDeductionYearly,
     incidents,
     incidentDoseYearly,
+    sharedLights,
+    sharedLightDoseYearly,
+    residencies,
     ledgers,
     measurementBatches,
   };

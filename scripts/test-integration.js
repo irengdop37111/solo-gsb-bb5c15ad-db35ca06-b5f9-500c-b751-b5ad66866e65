@@ -2783,6 +2783,317 @@ async function runFlow() {
     batchMeasItems.every((it) => it.sourceKey.startsWith('measurement:')),
     '批次实测作为 measurement 来源进入账册（sourceKey 口径一致）');
   assert(lgB.comparison.totals.total.zeroDifference === true, '封存瞬间对照零差额');
+
+  // ===========================================================================
+  // 规则 19：展厅 / 驻留（陈列关系）/ 共享照明
+  // ===========================================================================
+
+  // 1) 展厅登记：保管员可登记，标识唯一；布展员拒绝；登录用户可查
+  r = await call('POST', '/api/galleries', { code: 'S1', name: '共享厅甲' }, 'i');
+  assert(r.status === 403, '布展员不能登记展厅');
+  r = await call('POST', '/api/galleries', { code: 'S1', name: '共享厅甲' }, 'c');
+  assert(r.status === 201, '保管员登记展厅');
+  const galS1 = r.body.gallery.id;
+  r = await call('POST', '/api/galleries', { code: 'S1', name: '重复标识' }, 'c');
+  assert(r.status === 409 && r.body.details.existingGalleryId === galS1, '展厅标识唯一（409）');
+  r = await call('POST', '/api/galleries', { code: 'S2', name: '共享厅乙' }, 'c');
+  assert(r.status === 201, '第二个展厅');
+  const galS2 = r.body.gallery.id;
+  r = await call('GET', '/api/galleries', null, 'i');
+  assert(r.status === 200 && r.body.galleries.some((g) => g.code === 'S1'), '登录用户可查展厅列表');
+  r = await call('GET', '/api/galleries/S1', null, 'i');
+  assert(r.status === 200 && r.body.gallery.name === '共享厅甲', '按展厅标识取详情');
+  r = await call('GET', `/api/galleries/${galS1}`, null, 'c');
+  assert(r.status === 200 && r.body.gallery.code === 'S1', '按数字 id 取展厅详情');
+
+  // 2) 驻留登记与单件展品不重叠（跨展厅同样约束）
+  const exR1 = await createExhibit('驻留展品1');
+  const exR2 = await createExhibit('驻留展品2');
+  for (const y of [2023, 2024]) {
+    await call('POST', `/api/exhibits/${exR1}/limits`, { year: y, limitLxh: 100000 }, 'c');
+    await call('POST', `/api/exhibits/${exR2}/limits`, { year: y, limitLxh: 100000 }, 'c');
+  }
+  r = await call('POST', '/api/residencies',
+    { galleryCode: 'NOPE', exhibitId: exR1, startDate: '2024-01-01', endDate: '2024-06-30' }, 'c');
+  assert(r.status === 400, '未知展厅拒绝驻留');
+  r = await call('POST', '/api/residencies',
+    { galleryCode: 'S1', exhibitId: 999999, startDate: '2024-01-01', endDate: '2024-06-30' }, 'c');
+  assert(r.status === 400, '未知展品拒绝驻留');
+  r = await call('POST', '/api/residencies',
+    { galleryId: galS1, exhibitId: exR1, startDate: '2024-01-01', startTime: '10:00',
+      endDate: '2024-01-01', endTime: '10:00' }, 'c');
+  assert(r.status === 400, '起止无效（零时长同日同时刻）拒绝');
+  r = await call('POST', '/api/residencies',
+    { galleryId: galS1, exhibitId: exR1, startDate: '2024-02-01', endDate: '2024-01-01' }, 'c');
+  assert(r.status === 400, '结束日期早于开始日期拒绝');
+  r = await call('POST', '/api/residencies',
+    { galleryCode: 'S1', exhibitId: exR1, startDate: '2024-01-01', endDate: '2024-06-30' }, 'i');
+  assert(r.status === 403, '布展员不能登记驻留');
+  r = await call('POST', '/api/residencies',
+    { galleryCode: 'S1', exhibitId: exR1, startDate: '2024-01-01', endDate: '2024-06-30' }, 'c');
+  assert(r.status === 201, '登记驻留（整日：起 00:00，止 7/1 00:00）');
+  const resR1a = r.body.residency.id;
+  // 同期在另一展厅也冲突（单件展品驻留区间跨展厅不得重叠）
+  r = await call('POST', '/api/residencies',
+    { galleryCode: 'S2', exhibitId: exR1, startDate: '2024-03-01', endDate: '2024-04-01' }, 'c');
+  assert(r.status === 409 && r.body.details.overlappingResidencies[0].id === resR1a,
+    '跨展厅同期驻留拒绝（单件展品区间不重叠）');
+  // 端点相接允许
+  r = await call('POST', '/api/residencies',
+    { galleryCode: 'S1', exhibitId: exR1,
+      startDate: '2024-07-01', startTime: '00:00', endDate: '2024-12-31', endTime: '24:00' }, 'c');
+  assert(r.status === 400, '24:00 不是合法时刻');
+  r = await call('POST', '/api/residencies',
+    { galleryCode: 'S1', exhibitId: exR1, startDate: '2024-07-01', endDate: '2024-12-31' }, 'c');
+  assert(r.status === 201, '端点相接的下一段驻留允许（前半段止于 7/1 00:00）');
+  const resR1b = r.body.residency.id;
+  // 不同展品同期同展厅允许
+  r = await call('POST', '/api/residencies',
+    { galleryCode: 'S1', exhibitId: exR2, startDate: '2024-01-01', endDate: '2024-12-31' }, 'c');
+  assert(r.status === 201, '不同展品可同期驻留同一展厅');
+  const resR2 = r.body.residency.id;
+  // 未被覆盖的驻留可改可删
+  r = await call('PUT', `/api/residencies/${resR1b}`,
+    { startDate: '2024-07-02', endDate: '2024-12-31' }, 'c');
+  assert(r.status === 200, '未被照明覆盖的驻留可回改');
+  r = await call('PUT', `/api/residencies/${resR1b}`,
+    { startDate: '2024-07-01', endDate: '2024-12-31' }, 'c');
+  assert(r.status === 200, '改回区间');
+
+  // 3) 共享照明：窗内替代估算、窗外单独计量、按驻留交集归属多展品
+  const planR1 = await submitPlan(exR1, '驻留1计划', '2024-05-01', '2024-05-01',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(planR1);
+  const planR2 = await submitPlan(exR2, '驻留2计划', '2024-05-02', '2024-05-02',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(planR2);
+  // 两展品 2024 全年驻留（上面已登记）；照明 2024-05-01 12:00 ~ 20:00，200lx
+  // 展品1：计划窗 5/1 09-17 -> 窗内 12-17（5h=1000），窗外 17-20（3h=600）
+  // 展品2：计划窗 5/2 -> 与照明无交集，全部窗外（8h=1600）
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S1', startDate: '2024-05-01', startTime: '12:00',
+      endDate: '2024-05-01', endTime: '20:00', actualLux: 200, reason: '展厅统一补光' }, 'c');
+  assert(r.status === 201, `共享照明登记成功（多展品）（${r.status} ${r.body.error || ''}）`);
+  const sl1 = r.body.sharedLighting;
+  assert(sl1.attributions.length === 2, '按驻留交集归属到两件展品');
+  const attr1 = sl1.attributions.find((a) => a.exhibitId === exR1);
+  const attr2 = sl1.attributions.find((a) => a.exhibitId === exR2);
+  assert(attr1.yearly['2024'] === 1600 && attr1.yearlyInside['2024'] === 1000 &&
+    attr1.yearlyOutside['2024'] === 600 &&
+    JSON.stringify(attr1.insidePlanIds) === JSON.stringify([planR1]),
+    '展品1：全额1600，窗内1000替代计划估算，窗外600单独计量');
+  assert(attr2.yearly['2024'] === 1600 && attr2.yearlyInside['2024'] === undefined
+    && attr2.yearlyOutside['2024'] === 1600 && attr2.insidePlanIds.length === 0,
+    '展品2：照明日与其计划窗不同日，全部窗外单独计量');
+  // 展品1 年度占用：计划残余 300（8h-5h=3h×100）+ 窗内1000 + 窗外600 = 1900
+  r = await call('GET', `/api/exhibits/${exR1}`, null, 'c');
+  assert(r.body.years['2024'].used === 1900, `展品1占用1900，实际=${r.body.years['2024'].used}`);
+  assert(r.body.sources.some((s) => s.kind === 'sharedLight' && s.lightingId === sl1.id),
+    '占用来源含 sharedLight');
+  assert(r.body.sharedLights.length === 1 && r.body.sharedLights[0].galleryCode === 'S1',
+    '展品详情附共享照明归属');
+  assert(r.body.residencies.length === 2, '展品详情附驻留列表');
+  // 展品2 占用：计划残余 800 + 窗外 1600 = 2400
+  r = await call('GET', `/api/exhibits/${exR2}`, null, 'c');
+  assert(r.body.years['2024'].used === 2400, `展品2占用2400，实际=${r.body.years['2024'].used}`);
+  // 计划排期不释放：共享照明虽把 planR1 窗内 12-17 替代为实际用光，计划开灯窗仍占用排期，
+  // 再提交一条与其开灯窗重叠的计划，在提交阶段即按重叠拒绝
+  r = await call('POST', '/api/plans',
+    { exhibitId: exR1, title: '撞窗计划', startDate: '2024-05-01', endDate: '2024-05-01',
+      periods: ['10:00-11:00'], estimatedLux: 100 }, 'i');
+  assert(r.status === 409 && /重叠/.test(r.body.error), '共享照明不释放计划排期（撞窗提交即拒绝）');
+
+  // 4) 已被照明覆盖的驻留不得回改/删除
+  r = await call('PUT', `/api/residencies/${resR1a}`,
+    { startDate: '2024-01-05', endDate: '2024-06-30' }, 'c');
+  assert(r.status === 409 && r.body.details.coveredByLighting === true
+    && r.body.details.coveringLightingIds.includes(sl1.id),
+    '已覆盖驻留回改拒绝（409，列出覆盖照明）');
+  r = await call('DELETE', `/api/residencies/${resR2}`, {}, 'c');
+  assert(r.status === 409 && r.body.details.coveringLightingIds.includes(sl1.id),
+    '已覆盖驻留删除拒绝（409）');
+  // 未被覆盖的驻留仍可删（resR1b 区间 7/1 起，与 5/1 照明不相交）
+  r = await call('DELETE', `/api/residencies/${resR1b}`, {}, 'c');
+  assert(r.status === 200, '未被覆盖的驻留可删除');
+
+  // 5) 后续实测/停灯/事故碰到共享照明归属一律拒绝
+  r = await call('POST', '/api/measurements',
+    { planId: planR1, startDate: '2024-05-01', startTime: '13:00',
+      endDate: '2024-05-01', endTime: '14:00', actualLux: 50 }, 'c');
+  assert(r.status === 409 && r.body.details.overlappingSharedLightingId === sl1.id,
+    '录入实测碰共享照明归属拒绝');
+  r = await call('POST', '/api/blackouts',
+    { planId: planR1, startDate: '2024-05-01', startTime: '13:00',
+      endDate: '2024-05-01', endTime: '14:00', reason: '检修' }, 'c');
+  assert(r.status === 409, '停灯碰共享照明归属拒绝');
+  r = await call('POST', '/api/incidents',
+    { exhibitId: exR1, startDate: '2024-05-01', startTime: '13:00',
+      endDate: '2024-05-01', endTime: '14:00', actualLux: 50, reason: '事故' }, 'c');
+  assert(r.status === 409 && r.body.details.overlappingSharedLights.length === 1,
+    '事故碰共享照明归属拒绝并在 details 列出');
+  // CSV 批次行碰共享照明同样拒绝
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: planR1,
+    csv: '2024-05-01 13:00,2024-05-01 14:00,50\n',
+  }, 'c');
+  assert(r.status === 409 && /共享照明/.test(r.body.error),
+    'CSV 批次逐行校验含共享照明相交冲突（纯相交 409）');
+
+  // 6) 登记时与既有实测/停灯/事故相交：整次登记拒绝，逐展品列冲突，不落库
+  const exR3 = await createExhibit('驻留展品3');
+  await call('POST', `/api/exhibits/${exR3}/limits`, { year: 2024, limitLxh: 100000 }, 'c');
+  const planR3 = await submitPlan(exR3, '驻留3计划', '2024-08-01', '2024-08-01',
+    ['09:00-17:00'], 100);
+  await approvePlan(planR3);
+  await call('POST', '/api/residencies',
+    { galleryCode: 'S2', exhibitId: exR3, startDate: '2024-08-01', endDate: '2024-08-01' }, 'c');
+  // 先录一条待确认（draft）实测在 10:00-11:00
+  r = await call('POST', '/api/measurements',
+    { planId: planR3, startDate: '2024-08-01', startTime: '10:00',
+      endDate: '2024-08-01', endTime: '11:00', actualLux: 50 }, 'c');
+  assert(r.status === 201, '先录草稿实测');
+  const beforeCount = (await call('GET', '/api/shared-lightings', null, 'c')).body.sharedLightings.length;
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: '2024-08-01', startTime: '09:00',
+      endDate: '2024-08-01', endTime: '17:00', actualLux: 100, reason: '全天照明' }, 'c');
+  assert(r.status === 409, '与待确认实测相交的共享照明整次拒绝');
+  const ec = r.body.details.exhibitConflicts;
+  assert(Array.isArray(ec) && ec[0].exhibitId === exR3
+    && ec[0].overlappingMeasurements[0].status === 'draft',
+    'details.exhibitConflicts 逐展品列出冲突实测（含草稿）');
+  const afterCount = (await call('GET', '/api/shared-lightings', null, 'c')).body.sharedLightings.length;
+  assert(afterCount === beforeCount, '冲突时整次登记不保存');
+
+  // 7) 无驻留交集 / 尚未结束 / 非正照度 / 缺原因 -> 拒绝
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: '2024-09-01', startTime: '10:00',
+      endDate: '2024-09-01', endTime: '12:00', actualLux: 100, reason: '无展品' }, 'c');
+  assert(r.status === 409 && /没有交集/.test(r.body.error), '与所有驻留无交集拒绝（409）');
+  const futureDate = `${Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4)) + 1}-01-01`;
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: futureDate, startTime: '10:00',
+      endDate: futureDate, endTime: '12:00', actualLux: 100, reason: '未来' }, 'c');
+  assert(r.status === 400 && /尚未结束/.test(r.body.error), '照明尚未结束拒绝（400）');
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: '2024-08-01', startTime: '12:00',
+      endDate: '2024-08-01', endTime: '11:00', actualLux: 100, reason: '倒序' }, 'c');
+  assert(r.status === 400, '起止无效（结束早于开始）拒绝');
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: '2024-08-01', startTime: '12:00',
+      endDate: '2024-08-01', endTime: '13:00', actualLux: -5, reason: '负照度' }, 'c');
+  assert(r.status === 400, '非正照度拒绝');
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: '2024-08-01', startTime: '12:00',
+      endDate: '2024-08-01', endTime: '13:00', actualLux: 100 }, 'c');
+  assert(r.status === 400, '原因缺失拒绝');
+
+  // 8) 跨自然年拆分
+  const exR4 = await createExhibit('跨年共享展品');
+  for (const y of [2023, 2024]) {
+    await call('POST', `/api/exhibits/${exR4}/limits`, { year: y, limitLxh: 100000 }, 'c');
+  }
+  const planR4 = await submitPlan(exR4, '跨年共享计划', '2023-12-31', '2023-12-31',
+    ['22:00-02:00'], 100);
+  await approvePlan(planR4);
+  await call('POST', '/api/residencies',
+    { galleryCode: 'S2', exhibitId: exR4, startDate: '2023-12-31', endDate: '2024-01-01' }, 'c');
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: '2023-12-31', startTime: '20:00',
+      endDate: '2024-01-01', endTime: '04:00', actualLux: 100, reason: '跨年照明' }, 'c');
+  assert(r.status === 201, '跨年共享照明登记');
+  const slYear = r.body.sharedLighting.attributions[0];
+  assert(slYear.yearly['2023'] === 400 && slYear.yearly['2024'] === 400,
+    '全额按自然年拆分（各400）');
+  assert(slYear.yearlyInside['2023'] === 200 && slYear.yearlyInside['2024'] === 200
+    && slYear.yearlyOutside['2023'] === 200 && slYear.yearlyOutside['2024'] === 200,
+    '窗内/窗外同样跨年拆分（各200）');
+
+  // 9) 多展品超限：仍入账，返回各展品超额年份，未来计划转待复核（原子生效）
+  const exOv1 = await createExhibit('共享超限展品1');
+  const exOv2 = await createExhibit('共享超限展品2');
+  for (const ex of [exOv1, exOv2]) {
+    await call('POST', `/api/exhibits/${ex}/limits`, { year: 2024, limitLxh: 100000 }, 'c');
+    // 未来首灯的已批准计划（2024 年早已过去，此处用 2024 年未来不可行；改用当前年份的未来日）
+  }
+  const ovYear = Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4));
+  for (const ex of [exOv1, exOv2]) {
+    await call('POST', `/api/exhibits/${ex}/limits`, { year: ovYear, limitLxh: 900 }, 'c');
+    const pf = await submitPlan(ex, '共享未来计划', `${ovYear}-12-30`, `${ovYear}-12-30`,
+      ['09:00-17:00'], 100); // 800 估算残余，首灯在未来
+    await approvePlan(pf);
+    await call('POST', '/api/residencies',
+      { galleryCode: 'S2', exhibitId: ex, startDate: `${ovYear}-01-01`, endDate: `${ovYear}-12-31` }, 'c');
+    ex === exOv1 && (global.__ovPlan1 = pf);
+    ex === exOv2 && (global.__ovPlan2 = pf);
+  }
+  // 选择一个已过去的日期做照明（窗外 200；900 上限下 800 残余 + 200 = 1000，超额100）
+  const ovDay = `${ovYear}-01-15`;
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: ovDay, startTime: '10:00',
+      endDate: ovDay, endTime: '12:00', actualLux: 100, reason: '年初盘点照明' }, 'c');
+  assert(r.status === 409, '多展品共享照明超限仍入账，返回 409');
+  const ovYearsEx1 = r.body.overflows.filter((o) => o.exhibitId === exOv1);
+  const ovYearsEx2 = r.body.overflows.filter((o) => o.exhibitId === exOv2);
+  assert(ovYearsEx1.length === 1 && ovYearsEx1[0].year === ovYear
+    && ovYearsEx2.length === 1 && ovYearsEx2[0].excess === 100,
+    '返回各展品超额年份与超额量（各超 100）');
+  assert(r.body.flaggedPlans.length === 2, '两件展品的未来计划均转待复核');
+  // 照明确实已入账
+  r = await call('GET', `/api/shared-lightings?exhibitId=${exOv1}`, null, 'c');
+  assert(r.body.sharedLightings.length === 1, '超限后照明仍可查（已入账）');
+  r = await call('GET', `/api/exhibits/${exOv1}`, null, 'c');
+  assert(r.body.years[String(ovYear)].used === 1000 && r.body.years[String(ovYear)].over === true,
+    '超限年份占用如实显示 1000');
+  r = await call('GET', `/api/plans/${global.__ovPlan1}`, null, 'c');
+  assert(r.body.plan.status === 'pending_review' && /共享照明/.test(r.body.plan.review_reason),
+    '未来计划已转待复核且原因注明共享照明');
+
+  // 10) 共享照明永久保留，不可改删；列表/详情可读
+  const slList = await call('GET', '/api/shared-lightings?galleryCode=S1', null, 'i');
+  assert(slList.status === 200 && slList.body.sharedLightings.length === 1
+    && slList.body.sharedLightings[0].attributions.length === 2,
+    '布展员可只读查询共享照明（按展厅标识）');
+  r = await call('DELETE', `/api/shared-lightings/${sl1.id}`, {}, 'c');
+  assert(r.status === 400, '共享照明不可删除');
+  r = await call('PUT', `/api/shared-lightings/${sl1.id}`, { reason: 'x' }, 'c');
+  assert(r.status === 400, '共享照明不可修改');
+  r = await call('GET', `/api/shared-lightings/${sl1.id}`, null, 'c');
+  assert(r.status === 200 && r.body.sharedLighting.galleryCode === 'S1'
+    && r.body.sharedLighting.attributions.length === 2, '共享照明详情含逐展品归属');
+
+  // 11) 已封存账册不回写；共享照明在账册对照中作为新增来源出现
+  const exLg = await createExhibit('共享账册展品');
+  await call('POST', `/api/exhibits/${exLg}/limits`, { year: 2022, limitLxh: 100000 }, 'c');
+  const planLg = await submitPlan(exLg, '账册年计划', '2022-05-01', '2022-05-01',
+    ['09:00-17:00'], 100);
+  await approvePlan(planLg);
+  await call('POST', '/api/residencies',
+    { galleryCode: 'S2', exhibitId: exLg, startDate: '2022-05-01', endDate: '2022-05-01' }, 'c');
+  // 先封存（此时无共享照明）：计划残余 800
+  r = await call('POST', `/api/exhibits/${exLg}/ledgers`, { year: 2022 }, 'c');
+  assert(r.status === 201 && r.body.ledger.residueTotal === 800
+    && r.body.ledger.sharedLightTotal === 0,
+    '封存时无共享照明：残余800，共享照明合计0（旧形态字段缺省为0）');
+  const sharedRuleLedgerId = r.body.ledger.id;
+  // 封存后再登记共享照明（窗内 12-14 两小时 = 200 替代估算）
+  r = await call('POST', '/api/shared-lightings',
+    { galleryCode: 'S2', startDate: '2022-05-01', startTime: '12:00',
+      endDate: '2022-05-01', endTime: '14:00', actualLux: 100, reason: '封存后补登' }, 'c');
+  assert(r.status === 201, '封存年份仍可登记已发生共享照明（账册不回写）');
+  // 旧账原样
+  r = await call('GET', `/api/exhibits/${exLg}/ledgers/2022`, null, 'c');
+  assert(r.body.ledger.id === sharedRuleLedgerId && r.body.ledger.residueTotal === 800
+    && r.body.ledger.sharedLightTotal === 0, '已封存账册值不回写');
+  // 对照：当前值含共享照明来源
+  const slCur = r.body.current;
+  assert(slCur.sharedLightTotal === 200, '当前重算含共享照明 200');
+  const slSharedDiffs = r.body.comparison.itemDiffs.filter((d) => d.kind === 'sharedLight');
+  assert(slSharedDiffs.length === 1 && slSharedDiffs[0].sealed === false
+    && slSharedDiffs[0].present === true && slSharedDiffs[0].delta === 200,
+    '共享照明作为封存后新增来源（sharedLight:ID）出现在逐项对照');
+  // 计划残余当前值由 800 降到 600（窗内 200 替代）
+  const slPlanDiff = r.body.comparison.itemDiffs.find((d) => d.sourceKey === `plan:${planLg}`);
+  assert(slPlanDiff && slPlanDiff.delta === -200, '对照中计划残余因共享照明窗内替代而下降200');
 }
 
 main().catch((err) => {

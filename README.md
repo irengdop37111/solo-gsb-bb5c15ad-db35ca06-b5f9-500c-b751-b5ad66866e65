@@ -148,6 +148,35 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
     - 待确认批次不占额度、不参与重叠判定；批次确认生成的实测与单条实测**同口径**进入
       年度占用与封存账册对照（`sourceKey` 仍为 `measurement:ID`）；既有单条实测、年度占用与
       账册对照字段保持兼容（实测仅附加 `importBatchId`，展品详情仅附加 `measurementBatches`）。
+19. **展厅、驻留与共享照明（conservator 登记，登录用户可查）**：保管员先以唯一**展厅标识**
+    （`code`）登记展厅，再以**展厅标识 + 展品编号 + 驻留起止**登记陈列关系（驻留）；
+    在此基础上以**展厅标识 + 已发生的照明起止 + 正数实际照度 + 非空原因**登记一次**共享照明**。
+    - **驻留**：单件展品的驻留区间**不得重叠**（即使分布在不同展厅；端点相接允许）；
+      不同展品可同期驻留同一展厅。未被共享照明覆盖的驻留可由保管员修改起止/备注或删除；
+      **已被共享照明归属覆盖的驻留不得回改或删除**（409，列出覆盖它的共享照明编号）。
+    - **登记校验**：未知展厅/未知展品、起止无效（结束不晚于开始）、**照明尚未结束**
+      （结束晚于登记当时）一律拒绝；共享照明按与该展厅**各展品驻留区间的交集**归属各展品并按
+      墙上时间**跨自然年拆分**，**与任何展品驻留都没有交集时拒绝**。
+    - **整次登记的互斥核对**：对每件展品，归属区间（照明 ∩ 驻留）不得与该展品**未作废实测
+      （含待确认草稿）、停灯记录或已有的计划外照明事故**相交；任一展品冲突则**整次登记拒绝**，
+      409 在 `details.exhibitConflicts` 中**逐展品一次性列出全部冲突**，不落库。
+    - **计量口径（全系统一致）**：对各展品，归属区间与其已批准/待复核**计划开灯窗**相交的
+      部分按共享照明的**实际照度用光替代估算**（从该计划估算残余中扣除），**窗外部分单独计量**；
+      不释放任何计划排期（即使残余被替代为 0，撞其开灯窗的新计划仍按重叠拒绝）。
+      年度占用 = 已确认实测 + 计划外事故 + **共享照明归属实际用光** + 各计划估算残余；
+      计划批准/复核、调整与成对核准、联合核准、上限下调预演、展品占用与账册当前值全部采用同一口径。
+    - **后续操作互斥**：之后录入/确认实测、实测纠错、停灯登记、事故登记碰到共享照明归属时段
+      一律拒绝（实测录入/确认给出 `overlappingSharedLightingId`，纠错/停灯/事故在 `details`
+      列出 `overlappingSharedLights`；CSV 批次逐行校验同样标记共享照明相交）。
+    - **多展品原子生效、超限仍入账**：一次共享照明对多件展品的归属计量、以及超限引发的
+      待复核变更在**同一事务**内原子完成；造成任一年度超限时登记**仍生效**，返回 **409**，
+      `overflows` **逐展品列出超额年份**（含上限/预计合计/超额量），并把相关年度**尚未开始且
+      有估算残余**的已批准计划转待复核（原因注明由共享照明触发，审计 `plan.flag_review_shared_lighting`）。
+    - **永久保留与兼容**：展厅、驻留与共享照明均保留；共享照明不可修改/删除
+      （`PUT/DELETE` 返回 400）。**已封存账册不回写**，共享照明在账册对照中作为封存后新增
+      来源（`sharedLight:归属ID`）出现，账册另附 `sharedLightTotal` 合计。展品详情仅附加
+      `residencies`、`sharedLights`（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`/`insidePlanIds`）
+      与 `sharedLightDoseYearly`；占用来源仅附加 `kind:'sharedLight'`，既有字段保持兼容。
 
 ## 一键启动（Docker Compose）
 
@@ -265,8 +294,15 @@ npm run test:utils
     `POST /api/measurement-batches/:id/confirm`：系统在展品锁内按实时占用重新校验，全部有效才原子生成
     已确认实测（实测带 `importBatchId` 溯源）并记批次审计；重复确认返回原批次结果。若确认导致超限，
     批次仍入账，相关年度尚未开始且有估算残余的已批准计划自动转待复核。
+15. **多展品同厅共享照明**：保管员先在「展厅」用唯一展厅标识登记展厅（如 `A101`），再对各展品
+    登记**驻留起止**（单件展品驻留区间不得重叠）。一次全厅补光/统一照明结束后，在「共享照明」
+    选择展厅、填写**已发生**的起止时刻、实际照度与必填原因后登记：系统按照明与各展品驻留的
+    交集逐展品归属并跨自然年拆分，与计划开灯窗相交部分按实际用光替代估算、窗外单独计量；
+    若与某展品的未作废实测/停灯/事故相交，整次登记被拒并逐展品列出冲突。多展品计量与超限转待
+    复核原子生效，超限仍入账并返回各展品超额年份。已被照明覆盖的驻留不能回改；共享照明与
+    封存账册均永久保留。
 
-## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**计划外照明事故**、**实测纠错**、**年度账册封存**、**实测 CSV 批次导入**）
+## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**计划外照明事故**、**实测纠错**、**年度账册封存**、**实测 CSV 批次导入**、**展厅/驻留/共享照明**）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -289,7 +325,7 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | --- | --- | --- |
 | `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
-| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源（含 `kind:'incident'` 事故条目）、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`incidents` 计划外照明事故（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`）与 `incidentDoseYearly` 各年事故实际用光汇总、`ledgers` 已封存年度账册（每条附封存值与当前重算对照 `comparison`） |
+| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源（含 `kind:'incident'` 事故条目与 `kind:'sharedLight'` 共享照明归属条目）、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`incidents` 计划外照明事故（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`）与 `incidentDoseYearly` 各年事故实际用光汇总、`sharedLights` 共享照明归属（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`/`insidePlanIds`）与 `sharedLightDoseYearly` 各年共享照明实际用光汇总、`residencies` 驻留（含覆盖标记）、`ledgers` 已封存年度账册（每条附封存值与当前重算对照 `comparison`） |
 | `GET  /api/exhibits/:id/ledgers` | 登录 | 已封存年度账册列表；`?compare=1` 附按当前数据重算的对照差额 |
 | `POST /api/exhibits/:id/ledgers` | 保管员 | **封存某已结束自然年的用光账册**（原子快照）；未登记上限/年份未结束 400，重复封存 409 不覆盖旧账 |
 | `GET  /api/exhibits/:id/ledgers/:year` | 登录 | 某年封存账册 + 按当前数据重算值 + 上限/合计差额 + 按来源编号逐项差额（已消失来源仍列出，零差额标示） |
@@ -312,7 +348,14 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `POST /api/blackouts` | 保管员 | 登记已发生停灯时段；成功响应为展品详情（另附 `blackout`）；冲突 409 不保存 |
 | `GET /api/incidents?exhibitId=&planId=` | 登录 | **计划外照明事故**列表（登录可读，`planId` 过滤与该计划当前开灯窗相交的事故），逐条附按年实际用光及窗内/窗外拆分 |
 | `POST /api/incidents` | 保管员 | **登记已发生计划外照明事故**；成功（201）响应为展品详情（另附 `incident`）；事故致超限仍生效，返回 **409**（`overflows`/`flaggedPlans`/`detail`）；相交冲突 409 不保存 |
-| `GET /api/audit` | 保管员 | 操作流水（含 `blackout.create`、`incident.create`、`plan.flag_review_incident`） |
+| `GET  /api/galleries`、`GET /api/galleries/:ref` | 登录 | **展厅**列表（附驻留/共享照明计数）/ 详情（`:ref` 为展厅标识 code 或数字 id，附驻留与共享照明） |
+| `POST /api/galleries` | 保管员 | **登记展厅**（唯一展厅标识 `code` + 名称）；标识重复 409 |
+| `GET  /api/residencies?exhibitId=&galleryId=`、`GET /api/residencies/:id` | 登录 | **驻留（陈列关系）**列表/详情，附 `coveredByLighting` 与 `coveringLightingIds` |
+| `POST /api/residencies` | 保管员 | **登记驻留**：`galleryCode`/`galleryId` + `exhibitId` + 起止（日期可整日，可带时刻）；单件展品区间重叠 409 |
+| `PUT /api/residencies/:id`、`DELETE /api/residencies/:id` | 保管员 | 修改未覆盖驻留的起止/备注、删除未覆盖驻留；**已被共享照明覆盖 409** |
+| `GET  /api/shared-lightings?galleryId=&galleryCode=&exhibitId=`、`GET /api/shared-lightings/:id` | 登录 | **共享照明**列表/详情，逐条含逐展品 `attributions`（窗内/窗外按年剂量） |
+| `POST /api/shared-lightings` | 保管员 | **登记一次已发生共享照明**；未知展厅/起止无效/尚未结束 400；无驻留交集或逐展品互斥冲突 409（整次不保存）；多展品超限仍入账返回 **409**（`overflows` 逐展品超额年份、`flaggedPlans`、各展品 `detail`） |
+| `GET /api/audit` | 保管员 | 操作流水（含 `blackout.create`、`incident.create`、`plan.flag_review_incident`、`gallery.create`、`residency.create/update/delete`、`shared_lighting.create`、`plan.flag_review_shared_lighting`） |
 
 ### 计划调整申请 `/api/adjustments`
 
@@ -842,6 +885,158 @@ curl -b cookies.txt -X DELETE http://localhost:3000/api/incidents/1
 录入/纠错/停灯登记 `details.overlappingIncidents`）。审计写入 `incident.create`（target 为事故编号，
 detail 含时段/照度/原因/按年剂量）与转复核事件 `plan.flag_review_incident`。
 
+### 展厅 / 驻留 / 共享照明 `/api/galleries`、`/api/residencies`、`/api/shared-lightings`（保管员登记，登录可读）
+
+保管员先登记**展厅**（唯一展厅标识 `code`），再登记展品的**驻留（陈列关系）**，之后可登记一次
+展厅级、已发生的**共享照明**；系统按“照明 ∩ 各展品驻留”逐展品归属、跨自然年拆分计量。
+布展员仅有只读权限；共享照明一经保存**永久保留、不可修改/删除**（`PUT/DELETE` 返回 400）。
+
+**展厅**
+
+```bash
+# 保管员登记展厅（code 唯一，重复返回 409 details.existingGalleryId）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/galleries \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"A101","name":"一号书画厅","note":"恒温恒湿厅"}'
+
+# 登录用户查看列表 / 详情（:ref 可为展厅标识 code 或数字 id）
+curl -b cookies.txt http://localhost:3000/api/galleries
+curl -b cookies.txt http://localhost:3000/api/galleries/A101
+```
+
+展厅详情含 `residencies`（每条带 `coveredByLighting`/`coveringLightingIds`）与 `sharedLightings`。
+
+**驻留（陈列关系）**
+
+请求体用“日期 + 可选时刻”：只给日期时按**整日**计（开始当日 00:00 至次日 00:00，左闭右开）；
+给 `startTime/endTime` 时以精确时刻为准。单件展品的驻留区间即使分布在不同展厅也**不得重叠**
+（端点相接允许）。
+
+```bash
+# 展品 3 在 A101 整段陈列（2032-06-01 00:00 ~ 2032-09-01 00:00）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/residencies \
+  -H 'Content-Type: application/json' \
+  -d '{"galleryCode":"A101","exhibitId":3,"startDate":"2032-06-01","endDate":"2032-08-31"}'
+
+# 也可用精确时刻
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/residencies \
+  -H 'Content-Type: application/json' \
+  -d '{"galleryId":1,"exhibitId":4,"startDate":"2032-06-01","startTime":"09:00",
+       "endDate":"2032-06-02","endTime":"18:00"}'
+
+curl -b cookies.txt 'http://localhost:3000/api/residencies?exhibitId=3'
+```
+
+驻留对象含 `galleryCode/galleryName/exhibitName/start/end` 及覆盖标记。只有**尚未被共享照明
+覆盖**的驻留可修改/删除；已覆盖的回改或删除返回 **409**：
+
+```json
+{
+  "error": "驻留 #5 已被共享照明（#2、#3）覆盖，其归属不得回改；如需调整陈列关系，请登记新的驻留区间",
+  "details": { "coveredByLighting": true, "coveringLightingIds": [2, 3] }
+}
+```
+
+**共享照明**
+
+请求体（起止可跨日、可跨年，墙上时间，与实测/事故接口同形；时刻必填）：
+
+```json
+{
+  "galleryCode": "A101",
+  "startDate": "2032-06-01", "startTime": "12:00",
+  "endDate": "2032-06-01", "endTime": "20:00",
+  "actualLux": 200,
+  "reason": "全厅统一补光（晚场活动）"
+}
+```
+
+```bash
+# 保管员登记（成功 201；单展品成功时响应与事故接口同构——展品详情字段位于顶层，另附 sharedLighting）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/shared-lightings \
+  -H 'Content-Type: application/json' \
+  -d '{"galleryCode":"A101","startDate":"2024-05-10","startTime":"12:00",
+       "endDate":"2024-05-10","endTime":"20:00","actualLux":200,
+       "reason":"全厅统一补光"}'
+
+# 只读查询（按展厅标识 / 展厅 id / 展品 id；详情含逐展品归属）
+curl -b cookies.txt 'http://localhost:3000/api/shared-lightings?galleryCode=A101'
+curl -b cookies.txt 'http://localhost:3000/api/shared-lightings?exhibitId=3'
+curl -b cookies.txt http://localhost:3000/api/shared-lightings/1
+```
+
+登记校验：未知展厅、未知展品（驻留接口）、起止无效（结束不晚于开始）、非正照度、原因缺失为
+**400**；**照明尚未结束**（结束晚于当前时间）为 **400**。照明与该展厅**任何展品驻留都没有
+交集**为 **409**；与任一展品未作废实测（含草稿）、停灯、事故相交时**整次登记拒绝（409，
+不保存）**，`details.exhibitConflicts` 逐展品列出全部冲突：
+
+```json
+{
+  "error": "共享照明登记失败：展品 #3：与待确认实测 #31（2024-05-10 13:00 ~ 2024-05-10 14:00）相交；与停灯记录 #2（计划「夜场」，2024-05-10 15:00 ~ 2024-05-10 16:00）相交；展品 #4：与计划外照明事故 #1（2024-05-10 18:00 ~ 2024-05-10 19:00）相交，整次登记未保存",
+  "details": {
+    "galleryId": 1, "galleryCode": "A101",
+    "exhibitConflicts": [
+      { "exhibitId": 3,
+        "overlappingMeasurements": [ { "id": 31, "status": "draft", "start": "…", "end": "…" } ],
+        "overlappingBlackouts": [ { "id": 2, "planId": 7, "planTitle": "夜场", "start": "…", "end": "…" } ],
+        "overlappingIncidents": [] },
+      { "exhibitId": 4,
+        "overlappingMeasurements": [], "overlappingBlackouts": [],
+        "overlappingIncidents": [ { "id": 1, "start": "…", "end": "…" } ] }
+    ]
+  }
+}
+```
+
+成功响应中的逐展品归属（多展品时位于 `sharedLighting.attributions[]`，展品详情顶层
+`sharedLights[]` 同构）：
+
+```json
+{
+  "attributionId": 12,
+  "residencyId": 5,
+  "exhibitId": 3,
+  "exhibitName": "宋拓《兰亭序》册页",
+  "start": "2024-05-10 12:00",
+  "end": "2024-05-10 20:00",
+  "actualLux": 200,
+  "yearly": { "2024": 1600 },
+  "yearlyInside": { "2024": 1000 },
+  "yearlyOutside": { "2024": 600 },
+  "insidePlanIds": [7]
+}
+```
+
+- `yearly`：归属区间（照明 ∩ 驻留）的**实际用光**按年剂量（始终以 `actualLux` 全额计入）；
+- `yearlyInside`：与该展品已批准/待复核**计划开灯窗**相交部分（**替代计划估算**，残余相应扣除）；
+- `yearlyOutside`：**窗外部分**（单独计量）；归属跨年时各对象都按自然年拆分；
+- `insidePlanIds`：窗内部分相交到的计划编号。
+
+多展品登记造成任一年度超限时，**登记仍原子生效**，返回 **409**，逐展品给出超额年份并转待复核：
+
+```json
+{
+  "message": "共享照明 #7 已登记并计入各展品实际用光，但登记后超限：展品 #3 2032 年超出 100 lx·h；展品 #4 2032 年超出 250 lx·h。已将 2 条尚未开始的计划转为待复核",
+  "sharedLighting": { "id": 7, "attributions": [ ] },
+  "overflows": [
+    { "exhibitId": 3, "year": 2032, "limit": 900, "projected": 1000, "excess": 100 },
+    { "exhibitId": 4, "year": 2032, "limit": 500, "projected": 750, "excess": 250 }
+  ],
+  "flaggedPlans": [
+    { "exhibitId": 3, "id": 9, "title": "未开始计划", "firstStart": "2032-12-20 09:00", "overflowYears": [2032] }
+  ],
+  "exhibits": [ { "exhibitId": 3, "overflows": [ ], "flaggedPlans": [ ], "detail": { } } ]
+}
+```
+
+后续实测录入/确认、实测纠错、停灯、事故、CSV 批次行碰到共享照明归属时段一律 **409**
+（实测录入/确认 `details.overlappingSharedLightingId`；纠错/停灯/事故
+`details.overlappingSharedLights`；CSV 行 `conflicts.overlappingSharedLights`）。
+审计写入 `gallery.create`、`residency.create/update/delete`、`shared_lighting.create`
+（detail 含展厅/时段/照度/原因及逐展品按年窗内窗外剂量）与转复核事件
+`plan.flag_review_shared_lighting`。已封存账册原样保留，共享照明在账册对照中以新增来源
+`sharedLight:归属ID` 出现，账册合计另附 `sharedLightTotal`（旧账按 0 处理，字段兼容）。
+
 ### 实测纠错 `/api/measurements/:id/correct`（保管员）
 
 保管员发现**已确认实测**的时段或照度录错时，用**原记录编号**（路径 `:id`）、**替代时段**、
@@ -1174,8 +1369,9 @@ src/
   csv.js           实测 CSV 批次解析（表头识别、墙上日期时间、逐行取值校验）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
   ledger.js        年度用光账册封存：按年快照构建（复用统一占用口径）、封存校验落账、封存值与当前重算的逐项/合计差额对照
-  service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减、计划外照明事故登记校验/窗内替代窗外单独计量口径、实测批次逐行评估（窗口/相交/行间相交）与确认超限处理
-  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/measurement-batches（实测 CSV 批次导入：预览/导入/确认）/blackouts/incidents（计划外照明事故）/ledgers（年度账册封存与对照）/audit 路由
+  shared.js        展厅/驻留（陈列关系）/共享照明：展厅登记、驻留重叠与“已覆盖不得回改”守卫、共享照明按驻留交集逐展品归属（窗内替代估算/窗外单独计量/跨年拆分）、逐展品实测/停灯/事故互斥核对、占用视图
+  service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减、计划外照明事故登记校验/窗内替代窗外单独计量口径、共享照明归属占用口径、实测批次逐行评估（窗口/相交/行间相交）与确认超限处理
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/measurement-batches（实测 CSV 批次导入：预览/导入/确认）/blackouts/incidents（计划外照明事故）/galleries/residencies/shared-lightings（展厅/驻留/共享照明）/ledgers（年度账册封存与对照）/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
 scripts/test-integration.js  基于 pg-mem 的端到端业务流程测试（含年度账册封存/对照/并发）

@@ -35,10 +35,14 @@ function normalizePeriods(value) {
  *   - 已确认实测（kind='measurement'）：该年剂量（停灯不减实测）
  *   - 计划外照明事故（kind='incident'）：该年事故实际用光（始终全额计入；
  *     附窗内/窗外拆分，窗内部分替代计划估算、窗外部分单独计量）
- *   - 已批准/待复核计划估算残余（kind='plan'）：开灯窗 − 已确认实测覆盖 − 本计划停灯 − 事故窗内部分
- * 合计 total = confirmedTotal + incidentTotal + residueTotal。
+ *   - 共享照明归属（kind='sharedLight'，规则 19）：该年共享照明∩驻留的实际用光
+ *     （始终全额计入；附展厅/来源照明/驻留与窗内窗外拆分）
+ *   - 已批准/待复核计划估算残余（kind='plan'）：开灯窗 − 已确认实测覆盖 − 本计划停灯
+ *     − 事故窗内部分 − 共享照明窗内部分
+ * 合计 total = confirmedTotal + incidentTotal + sharedLightTotal + residueTotal。
  * 返回：
- *   { year, limit, confirmedTotal, incidentTotal, residueTotal, total, items, sealedAtWall, tzOffsetMinutes }
+ *   { year, limit, confirmedTotal, incidentTotal, sharedLightTotal, residueTotal, total, items,
+ *     sealedAtWall, tzOffsetMinutes }
  * items 元素稳定结构（供封存与重算共用、逐项对齐）：
  *   { sourceKey, kind, id, label, planId?, title?, status?, startDate?, endDate?,
  *     periods?, lux?, start?, end?, yearDose }
@@ -53,9 +57,10 @@ async function buildYearSnapshot(client, exhibitId, year) {
   const items = [];
   let confirmedTotal = 0;
   let incidentTotal = 0;
+  let sharedLightTotal = 0;
   let residueTotal = 0;
 
-  // 占用来源的顺序即 computeOccupancy 的顺序：先实测，再事故，后计划（各自按 id 升序）。
+  // 占用来源的顺序即 computeOccupancy 的顺序：实测、事故、共享照明、计划（各自按 id 升序）。
   for (const s of occupancy.sources) {
     const yearDose = round3(s.yearly[yearStr] || 0);
     if (yearDose === 0) continue;
@@ -88,6 +93,27 @@ async function buildYearSnapshot(client, exhibitId, year) {
         yearOutside: round3((s.yearlyOutside || {})[yearStr] || 0),
         yearDose,
       });
+    } else if (s.kind === 'sharedLight') {
+      sharedLightTotal = round3(sharedLightTotal + yearDose);
+      items.push({
+        sourceKey: `sharedLight:${s.id}`,
+        kind: 'sharedLight',
+        id: s.id,
+        label: `共享照明 #${s.lightingId} 归属（展厅「${s.galleryName || s.galleryCode}」）`,
+        lightingId: s.lightingId,
+        residencyId: s.residencyId,
+        galleryId: s.galleryId,
+        galleryCode: s.galleryCode,
+        galleryName: s.galleryName,
+        start: s.start,
+        end: s.end,
+        lux: s.lux,
+        reason: s.reason,
+        insidePlanIds: s.insidePlanIds || [],
+        yearInside: round3((s.yearlyInside || {})[yearStr] || 0),
+        yearOutside: round3((s.yearlyOutside || {})[yearStr] || 0),
+        yearDose,
+      });
     } else {
       residueTotal = round3(residueTotal + yearDose);
       items.push({
@@ -111,8 +137,9 @@ async function buildYearSnapshot(client, exhibitId, year) {
     limit,
     confirmedTotal,
     incidentTotal,
+    sharedLightTotal,
     residueTotal,
-    total: round3(confirmedTotal + incidentTotal + residueTotal),
+    total: round3(confirmedTotal + incidentTotal + sharedLightTotal + residueTotal),
     items,
   };
 }
@@ -126,6 +153,8 @@ function snapshotFromLedgerRow(row) {
     confirmedTotal: round3(Number(row.confirmed_lxh)),
     // 旧账（事故功能上线前封存）没有 incidentTotal：按 0 处理，总额列保持原样
     incidentTotal: snap.incidentTotal !== undefined ? round3(Number(snap.incidentTotal)) : 0,
+    // 旧账（共享照明功能上线前封存）没有 sharedLightTotal：按 0 处理
+    sharedLightTotal: snap.sharedLightTotal !== undefined ? round3(Number(snap.sharedLightTotal)) : 0,
     residueTotal: round3(Number(row.residue_lxh)),
     total: round3(Number(row.total_lxh)),
     items: Array.isArray(snap.items) ? snap.items : [],
@@ -226,6 +255,11 @@ function diffSnapshots(sealed, current) {
       sealed.incidentTotal !== undefined ? sealed.incidentTotal : 0,
       current.incidentTotal !== undefined ? current.incidentTotal : 0
     ),
+    sharedLightTotal: field(
+      'sharedLightTotal',
+      sealed.sharedLightTotal !== undefined ? sealed.sharedLightTotal : 0,
+      current.sharedLightTotal !== undefined ? current.sharedLightTotal : 0
+    ),
     residueTotal: field('residueTotal', sealed.residueTotal, current.residueTotal),
     total: field('total', sealed.total, current.total),
   };
@@ -233,6 +267,7 @@ function diffSnapshots(sealed, current) {
     totals.limit.zeroDifference &&
     totals.confirmedTotal.zeroDifference &&
     totals.incidentTotal.zeroDifference &&
+    totals.sharedLightTotal.zeroDifference &&
     totals.residueTotal.zeroDifference &&
     totals.total.zeroDifference;
   totals.anyItemDifference = itemDiffs.some((it) => !it.zeroDifference);
@@ -272,6 +307,7 @@ function serializeLedger(row, diff = null) {
     limit: snap.limit,
     confirmedTotal: snap.confirmedTotal,
     incidentTotal: snap.incidentTotal !== undefined ? snap.incidentTotal : 0,
+    sharedLightTotal: snap.sharedLightTotal !== undefined ? snap.sharedLightTotal : 0,
     residueTotal: snap.residueTotal,
     total: snap.total,
     items: snap.items,
@@ -350,6 +386,7 @@ async function sealYearLedger(client, exhibitId, year, actor, { nowMs = Date.now
       JSON.stringify({
         items: snapshot.items,
         incidentTotal: snapshot.incidentTotal,
+        sharedLightTotal: snapshot.sharedLightTotal,
         sealedAtWall: tsToWallString(nowMs),
         sealedAtMs: nowMs,
         tzOffsetMinutes: config.tzOffsetMinutes,

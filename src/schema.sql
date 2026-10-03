@@ -223,3 +223,73 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_events (target_type, target_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events (created_at);
+
+-- ===========================================================================
+-- 展厅 / 驻留（陈列关系）/ 共享照明（规则 19）
+-- ===========================================================================
+
+-- 展厅：以唯一“展厅标识”登记，保管员维护，登录用户可查。
+CREATE TABLE IF NOT EXISTS galleries (
+    id              BIGSERIAL PRIMARY KEY,
+    code            TEXT NOT NULL UNIQUE,
+    name            TEXT NOT NULL,
+    note            TEXT,
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 驻留（陈列关系）：展品在某展厅的陈列起止（墙上时间，左闭右开）。
+-- 同一展品的驻留区间不得重叠（端点相接允许，见排除自身的排他索引/应用层校验）；
+-- 不同展品可同期驻留同一展厅。驻留一经登记永久保留；不提供删除接口。
+-- 已被共享照明归属覆盖的驻留其区间不得回改（应用层校验 + 归属行 FK 兜底）。
+CREATE TABLE IF NOT EXISTS residencies (
+    id              BIGSERIAL PRIMARY KEY,
+    gallery_id      BIGINT NOT NULL REFERENCES galleries(id),
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id),
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    note            TEXT,
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_residency_exhibit ON residencies (exhibit_id, start_ts, end_ts);
+CREATE INDEX IF NOT EXISTS idx_residency_gallery ON residencies (gallery_id, start_ts, end_ts);
+
+-- 共享照明（规则 19）：一次展厅级实际照明，按“与各展品驻留区间的交集”归属各展品。
+-- 只登记已发生照明（end_ts 不晚于登记当时），实际照度为正、原因必填。
+-- 记录一经写入永久保留：不提供修改/删除接口。
+CREATE TABLE IF NOT EXISTS shared_lightings (
+    id              BIGSERIAL PRIMARY KEY,
+    gallery_id      BIGINT NOT NULL REFERENCES galleries(id),
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    actual_lux      NUMERIC(10,2) NOT NULL CHECK (actual_lux > 0),
+    reason          TEXT NOT NULL,
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_shared_light_gallery ON shared_lightings (gallery_id, start_ts, end_ts);
+
+-- 共享照明按展品归属：一次共享照明 × 一件有驻留交集的展品一行（区间为照明∩驻留）。
+-- 归属区间按墙上自然年拆分计量：与该展品已批准/待复核计划开灯窗相交部分按实际用光替代估算
+-- （yearly_inside_json），窗外部分单独计量（yearly_outside_json），合计 yearly_json。
+-- 归属行一经写入永久保留，是“已被照明覆盖的驻留归属不得回改”的判定依据。
+CREATE TABLE IF NOT EXISTS shared_light_attributions (
+    id              BIGSERIAL PRIMARY KEY,
+    shared_lighting_id BIGINT NOT NULL REFERENCES shared_lightings(id) ON DELETE CASCADE,
+    residency_id    BIGINT NOT NULL REFERENCES residencies(id),
+    gallery_id      BIGINT NOT NULL REFERENCES galleries(id),
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id),
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    actual_lux      NUMERIC(10,2) NOT NULL CHECK (actual_lux > 0),
+    yearly_json         JSONB NOT NULL DEFAULT '{}',
+    yearly_inside_json  JSONB NOT NULL DEFAULT '{}',
+    yearly_outside_json JSONB NOT NULL DEFAULT '{}',
+    inside_plan_ids     JSONB NOT NULL DEFAULT '[]',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (shared_lighting_id, exhibit_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sla_exhibit ON shared_light_attributions (exhibit_id, start_ts, end_ts);
+CREATE INDEX IF NOT EXISTS idx_sla_residency ON shared_light_attributions (residency_id);
+CREATE INDEX IF NOT EXISTS idx_sla_lighting ON shared_light_attributions (shared_lighting_id);
