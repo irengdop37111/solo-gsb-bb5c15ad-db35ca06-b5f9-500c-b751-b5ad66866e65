@@ -217,6 +217,14 @@ function renderDetail() {
         <div class="source-doses">实际用光：${yearlyText(s.yearly)}
           <div class="small muted">窗内替代估算：${inside}；窗外单独计量：${outside}</div></div></div>`;
     }
+    if (s.kind === 'sharedLighting') {
+      const inside = Object.entries(s.yearlyInside || {}).map(([y, v]) => `${y}年 ${fmtN(v)}`).join('，') || '无';
+      const outside = Object.entries(s.yearlyOutside || {}).map(([y, v]) => `${y}年 ${fmtN(v)}`).join('，') || '无';
+      return `<div class="source-item shared">
+        共享照明 #${s.id}（展厅「${esc(s.hallCode || '')}」）：${esc(s.start)} ~ ${esc(s.end)}，${s.lux} lx，${esc(s.reason || '')}
+        <div class="source-doses">归属实际用光：${yearlyText(s.yearly)}
+          <div class="small muted">窗内替代估算：${inside}；窗外单独计量：${outside}</div></div></div>`;
+    }
     return `<div class="source-item plan ${s.status}">
       估算残余 · 计划 #${s.id}「${esc(s.title)}」${badge(s.status)}
       ：${esc(s.startDate)} ~ ${esc(s.endDate)}，每日 ${(s.periods || []).map(esc).join('、')}，${s.lux} lx
@@ -229,6 +237,8 @@ function renderDetail() {
     '<tr><td colspan="7" class="muted">暂无实测</td></tr>';
   renderBlackouts(d);
   renderIncidents(d);
+  renderResidences(d);
+  renderSharedLightings(d);
   renderLedgers(d);
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
@@ -272,7 +282,9 @@ function renderLedgers(d) {
           else if (it.zeroDifference) state = '<span class="tag zero">无差额</span>';
           else state = `<span class="tag ${it.delta > 0 ? 'up' : 'down'}">${it.delta > 0 ? '+' : ''}${fmtN(it.delta)}</span>`;
           return `<tr${!it.present ? ' class="over-row"' : ''}>
-            <td>${it.kind === 'measurement' ? '实测' : it.kind === 'incident' ? '照明事故' : '估算残余'}</td>
+            <td>${it.kind === 'measurement' ? '实测'
+              : it.kind === 'incident' ? '照明事故'
+              : it.kind === 'sharedLighting' ? '共享照明' : '估算残余'}</td>
             <td>#${it.id}</td>
             <td class="small">${esc(it.label)}</td>
             <td class="mono">${it.sealedDose === null ? '<span class="muted">—</span>' : fmtN(it.sealedDose)}</td>
@@ -294,6 +306,8 @@ function renderLedgers(d) {
             <td class="mono">${t ? fmtN(t.confirmedTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.confirmedTotal)}</td></tr>
           <tr><td>计划外照明事故合计</td><td class="mono">${fmtN(lg.incidentTotal || 0)}</td>
             <td class="mono">${t ? fmtN(t.incidentTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.incidentTotal)}</td></tr>
+          <tr><td>共享照明归属合计</td><td class="mono">${fmtN(lg.sharedLightingTotal || 0)}</td>
+            <td class="mono">${t ? fmtN(t.sharedLightingTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.sharedLightingTotal)}</td></tr>
           <tr><td>各计划估算残余合计</td><td class="mono">${fmtN(lg.residueTotal)}</td>
             <td class="mono">${t ? fmtN(t.residueTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.residueTotal)}</td></tr>
           <tr><td><b>合计</b></td><td class="mono"><b>${fmtN(lg.total)}</b></td>
@@ -472,6 +486,135 @@ $('#incident-form')?.addEventListener('submit', async (e) => {
     flash('error', err.message);
   }
 });
+
+/** 渲染展厅驻留（含是否已被共享照明覆盖）。 */
+function renderResidences(d) {
+  const tbody = $('#detail-residence-tbody');
+  if (!tbody) return;
+  const list = d.residences || [];
+  tbody.innerHTML = list.length ? list.map((x) => `<tr>
+      <td>${x.id}</td>
+      <td>${esc(x.hallCode)}</td>
+      <td>${esc(x.start)}</td><td>${esc(x.end)}</td>
+      <td>${x.covered ? '<span class="tag gone">已被共享照明覆盖（不可回改）</span>' : '<span class="tag zero">可修改/删除</span>'}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="5" class="muted">尚无驻留</td></tr>';
+}
+
+/** 渲染归属本展品的共享照明（按年实际用光、窗内/窗外拆分）。 */
+function renderSharedLightings(d) {
+  const tbody = $('#detail-shared-tbody');
+  if (!tbody) return;
+  const list = d.sharedLightings || [];
+  const splitText = (sh) => {
+    const years = new Set([
+      ...Object.keys(sh.yearly || {}),
+      ...Object.keys(sh.yearlyInside || {}),
+      ...Object.keys(sh.yearlyOutside || {}),
+    ]);
+    if (!years.size) return '无剂量';
+    return [...years].sort().map((y) =>
+      `${y}年：${fmtN((sh.yearly || {})[y] || 0)}（窗内 ${fmtN((sh.yearlyInside || {})[y] || 0)} / 窗外 ${fmtN((sh.yearlyOutside || {})[y] || 0)}）`
+    ).join('，');
+  };
+  tbody.innerHTML = list.length ? list.map((x) => `<tr>
+      <td>${x.id}</td>
+      <td>${esc(x.hallCode || '')}</td>
+      <td>${esc(x.start)}</td><td>${esc(x.end)}</td>
+      <td class="mono">${fmtN(x.actualLux)}</td>
+      <td>${esc(x.reason)}</td>
+      <td class="mono small">${splitText(x)}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="7" class="muted">尚无共享照明</td></tr>';
+}
+
+$('#residence-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const fd = new FormData(e.target);
+  try {
+    const payload = {
+      exhibitId: state.detail.exhibit.id,
+      hallCode: fd.get('hallCode'),
+      startDate: fd.get('startDate'),
+      startTime: fd.get('startTime') || undefined,
+      endDate: fd.get('endDate'),
+      endTime: fd.get('endTime') || undefined,
+    };
+    const r = await api('POST', '/api/residences', payload);
+    state.detail = await refreshDetail();
+    e.target.reset();
+    renderDetail();
+    flash('success', `驻留 #${r.residence.id}（展厅「${r.residence.hallCode}」）已登记`);
+  } catch (err) {
+    flash('error', err.message);
+  }
+});
+
+$('#shared-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const fd = new FormData(e.target);
+  try {
+    const payload = {
+      hallCode: fd.get('hallCode'),
+      startDate: fd.get('startDate'),
+      startTime: fd.get('startTime') || undefined,
+      endDate: fd.get('endDate'),
+      endTime: fd.get('endTime') || undefined,
+      actualLux: Number(fd.get('actualLux')),
+      reason: fd.get('reason'),
+    };
+    const detail = await api('POST', '/api/shared-lightings', payload);
+    e.target.reset();
+    if (detail.exhibit) {
+      state.detail = detail;
+      renderDetail();
+    } else {
+      state.detail = await refreshDetail();
+      renderDetail();
+    }
+    const id = detail.sharedLightingId || (detail.sharedLighting && detail.sharedLighting.id);
+    flash('success', `共享照明 #${id} 已按驻留归属各展品并计入实际用光；记录保留、不可改删`);
+  } catch (err) {
+    if (err.status === 409 && err.data) {
+      if (err.data.exhibitDetails) {
+        // 超限仍入账：刷新到本展品详情
+        const own = err.data.exhibitDetails.find(
+          (x) => Number(x.exhibit.id) === Number(state.detail.exhibit.id)
+        );
+        if (own) { state.detail = own; renderDetail(); }
+        const html = '<ul>' + (err.data.overflows || []).map((o) =>
+          `<li>展品 #${o.exhibitId} ${o.year} 年：登记后合计 ${fmtN(o.projected)}，<b>超额 ${fmtN(o.excess)} lx·h</b></li>`
+        ).join('') + '</ul>'
+          + (err.data.flaggedPlans && err.data.flaggedPlans.length
+            ? '<div>已转为待复核的计划：' + err.data.flaggedPlans
+              .map((p) => `展品#${p.exhibitId} 计划#${p.id}《${esc(p.title)}》`).join('、') + '</div>'
+            : '');
+        flash('warn', `共享照明 #${err.data.sharedLightingId} 已登记并计入实际用光，但造成超限`, html);
+        return;
+      }
+      if (err.data.details && err.data.details.conflictsByExhibit) {
+        const items = [];
+        for (const [exId, c] of Object.entries(err.data.details.conflictsByExhibit)) {
+          (c.overlappingMeasurements || []).forEach((m) =>
+            items.push(`展品 #${exId}：与${m.status === 'draft' ? '待确认' : '已确认'}实测 #${m.id} 相交`));
+          (c.overlappingBlackouts || []).forEach((b) =>
+            items.push(`展品 #${exId}：与停灯记录 #${b.id} 相交`));
+          (c.overlappingIncidents || []).forEach((x) =>
+            items.push(`展品 #${exId}：与照明事故 #${x.id} 相交`));
+        }
+        flash('error', err.message, '<ul>' + items.map((x) => `<li>${x}</li>`).join('') + '</ul>');
+        return;
+      }
+    }
+    flash('error', err.message);
+  }
+});
+
+async function refreshDetail() {
+  return api('GET', `/api/exhibits/${state.detail.exhibit.id}`);
+}
 
 function planRow(p) {
   return `<tr>

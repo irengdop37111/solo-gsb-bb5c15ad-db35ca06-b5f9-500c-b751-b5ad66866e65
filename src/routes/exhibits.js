@@ -85,6 +85,21 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     }
   }
 
+  // 展厅驻留（陈列关系，附是否已被共享照明覆盖）与共享照明归属（规则 19）；仅附加字段
+  const { serializeResidence } = require('./residences');
+  const { loadResidenceView } = require('../service');
+  const residenceView = await loadResidenceView(client, exhibitId);
+  const residences = residenceView.items.map(serializeResidence);
+  const { serializeSharedLighting } = require('./shared-lightings');
+  const sharedLightings = (occupancy.sharedLightings || []).map(serializeSharedLighting);
+  const sharedLightingDoseYearly = {};
+  for (const sh of sharedLightings) {
+    for (const [y, d] of Object.entries(sh.yearly || {})) {
+      sharedLightingDoseYearly[y] =
+        Math.round(((sharedLightingDoseYearly[y] || 0) + d) * 1000) / 1000;
+    }
+  }
+
   // 已封存年度账册（不可变）：附按当前数据重算的对照差额（仅附加字段，不影响既有消费者）
   const ledgerRows = await listSealedLedgers(client, exhibitId);
   const ledgers = [];
@@ -120,6 +135,9 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     blackoutDeductionYearly,
     incidents,
     incidentDoseYearly,
+    residences,
+    sharedLightings,
+    sharedLightingDoseYearly,
     ledgers,
     measurementBatches,
   };

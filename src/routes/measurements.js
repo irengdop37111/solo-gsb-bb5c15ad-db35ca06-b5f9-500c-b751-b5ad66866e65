@@ -19,6 +19,7 @@ const {
   computeOccupancy,
   overflowInfoFromOccupancy,
   flagPlansForOverflow,
+  findOverlappingSharedLighting,
 } = require('../service');
 const { doseByYear, yearMapToObject, tsToWallString } = require('../dosing');
 const { exhibitDetail, serializeMeasurement } = require('./exhibits');
@@ -155,6 +156,18 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         throw new ConflictError(
           `实测时段与计划外照明事故 #${incidentClashRows[0].id} 相交，确认被拒绝；事故已按实际用光计量，事故记录不可修改/删除`,
           { overlappingIncidentId: incidentClashRows[0].id }
+        );
+      }
+
+      // 共享照明归属与实测互斥：确认碰到既有共享照明归属时段同样拒绝
+      const sharedClash = await findOverlappingSharedLighting(
+        client, plan.exhibit_id, start, end
+      );
+      if (sharedClash) {
+        throw new ConflictError(
+          `实测时段与共享照明 #${sharedClash.session_id}（展厅「${sharedClash.hall_code}」）的归属时段相交，确认被拒绝；` +
+          '共享照明已按实际用光计量，记录不可修改/删除',
+          { overlappingSharedLightingId: Number(sharedClash.session_id) }
         );
       }
 

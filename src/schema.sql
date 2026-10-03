@@ -189,6 +189,63 @@ CREATE INDEX IF NOT EXISTS idx_mib_plan ON measurement_import_batches (plan_id, 
 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS import_batch_id BIGINT
     REFERENCES measurement_import_batches(id);
 
+-- 展厅（以展厅标识 hall_code 识别；首次为某展厅登记驻留时自动创建）。
+CREATE TABLE IF NOT EXISTS halls (
+    id              BIGSERIAL PRIMARY KEY,
+    hall_code       TEXT NOT NULL UNIQUE,
+    name            TEXT,
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 展品展厅驻留（陈列关系）：保管员以“展厅标识 + 展品编号 + 驻留起止”登记。
+-- 不变量：单件展品的驻留区间不得重叠（不同展品同期驻留同一展厅允许）。
+-- 已被共享照明归属覆盖的驻留不得回改（修改/删除由接口层查 shared_lighting_allocations 拒绝）。
+CREATE TABLE IF NOT EXISTS exhibit_residences (
+    id              BIGSERIAL PRIMARY KEY,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    hall_id         BIGINT NOT NULL REFERENCES halls(id),
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_residence_exhibit ON exhibit_residences (exhibit_id, start_ts);
+CREATE INDEX IF NOT EXISTS idx_residence_hall ON exhibit_residences (hall_id, start_ts);
+
+-- 共享照明（规则 19）：保管员以“展厅标识 + 已发生的照明起止 + 正数实际照度 + 非空原因”
+-- 登记一次展厅共享照明。照明按与各展品驻留区间的交集归属各展品并跨自然年拆分；
+-- 与该展品未作废实测、停灯或已有照明事故相交则整次登记拒绝；无任何展品驻留交集时拒绝。
+-- 记录一经写入永久保留：不提供修改/删除接口。
+CREATE TABLE IF NOT EXISTS shared_lightings (
+    id              BIGSERIAL PRIMARY KEY,
+    hall_id         BIGINT NOT NULL REFERENCES halls(id),
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    actual_lux      NUMERIC(10,2) NOT NULL CHECK (actual_lux > 0),
+    reason          TEXT NOT NULL,
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_shared_lighting_hall ON shared_lightings (hall_id, start_ts);
+
+-- 共享照明归属分段：一次共享照明与某条驻留区间的交集（非空）生成一条归属，归属到该展品；
+-- 同一驻留对同一次照明至多一条（UNIQUE）。归属分段即该展品的共享照明实际用光窗，
+-- 永久保留；驻留被任一行引用即视为“已被照明覆盖”，不得回改。
+CREATE TABLE IF NOT EXISTS shared_lighting_allocations (
+    id              BIGSERIAL PRIMARY KEY,
+    session_id      BIGINT NOT NULL REFERENCES shared_lightings(id) ON DELETE CASCADE,
+    residence_id    BIGINT NOT NULL REFERENCES exhibit_residences(id),
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    actual_lux      NUMERIC(10,2) NOT NULL CHECK (actual_lux > 0)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_shared_alloc_session_residence
+    ON shared_lighting_allocations (session_id, residence_id);
+CREATE INDEX IF NOT EXISTS idx_shared_alloc_exhibit ON shared_lighting_allocations (exhibit_id, start_ts);
+CREATE INDEX IF NOT EXISTS idx_shared_alloc_residence ON shared_lighting_allocations (residence_id);
+
 -- 年度用光账册封存（保管员可对展品“已结束的自然年”封存一份不可变账册）。
 -- 封存时按当时的固定时区与统一剂量口径原子记录：
 --   当年上限、已确认实测剂量合计、各计划“开灯窗 − 已确认实测覆盖 − 本计划停灯”的估算残余、

@@ -16,6 +16,8 @@ const measurementRoutes = require('./routes/measurements');
 const measurementBatchRoutes = require('./routes/measurement-batches');
 const blackoutRoutes = require('./routes/blackouts');
 const incidentRoutes = require('./routes/incidents');
+const residenceRoutes = require('./routes/residences');
+const sharedLightingRoutes = require('./routes/shared-lightings');
 const ledgerRoutes = require('./routes/ledgers');
 const auditRoutes = require('./routes/audit');
 
@@ -36,6 +38,9 @@ function createApp() {
   app.use('/api/measurement-batches', measurementBatchRoutes.router);
   app.use('/api/blackouts', blackoutRoutes.router);
   app.use('/api/incidents', incidentRoutes.router);
+  app.use('/api/halls', residenceRoutes.hallRouter);
+  app.use('/api/residences', residenceRoutes.router);
+  app.use('/api/shared-lightings', sharedLightingRoutes.router);
   app.use('/api/exhibits/:id/ledgers', ledgerRoutes);
   app.use('/api/audit', auditRoutes);
 

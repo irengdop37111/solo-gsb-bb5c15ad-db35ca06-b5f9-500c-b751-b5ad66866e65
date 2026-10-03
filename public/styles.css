@@ -102,6 +102,7 @@ tr.over-row td { background: #fdeceb; }
 }
 .source-item.measurement { border-left-color: #176b3a; }
 .source-item.incident { border-left-color: #b42318; }
+.source-item.shared { border-left-color: #7c3aed; }
 .source-item.plan { border-left-color: #1d4f91; }
 .source-item.plan.pending_review { border-left-color: #d97706; }
 .source-doses { margin-top: 3px; color: #52606d; font-size: 12.5px; }

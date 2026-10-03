@@ -23,6 +23,7 @@ const {
   batchConflictMessages,
   clipIntervalToWindowsForPlan,
   loadIncidentView,
+  loadSharedLightingView,
 } = require('../service');
 const {
   doseByYear,
@@ -398,8 +399,11 @@ async function approve(req, res) {
     // 与本计划开灯窗相交的计划外事故部分：事故按实际照度计量，替代相应估算（窗外部分已单独计量）
     const incidentView = await loadIncidentView(client, plan.exhibit_id);
     const selfIncidents = clipIntervalToWindowsForPlan(targetWindows, incidentView.windows);
+    // 与本计划开灯窗相交的共享照明归属部分：同口径替代估算
+    const sharedView = await loadSharedLightingView(client, plan.exhibit_id);
+    const selfShared = clipIntervalToWindowsForPlan(targetWindows, sharedView.windows);
     const remainingWindows = subtractIntervals(
-      targetWindows, [...selfMeas, ...selfBlackouts, ...selfIncidents]
+      targetWindows, [...selfMeas, ...selfBlackouts, ...selfIncidents, ...selfShared]
     );
     const addedYearly = yearMapToObject(doseByYear(remainingWindows, Number(plan.estimated_lux)));
 

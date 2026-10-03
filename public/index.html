@@ -157,6 +157,48 @@
             起止无效、照度非正、原因缺失，或事故与同展品未作废实测（含草稿）、停灯、其他事故相交时拒绝保存并指出冲突。
           </p>
 
+          <h4>展厅驻留（陈列关系）</h4>
+          <p class="muted small">保管员以「展厅标识 + 展品 + 驻留起止」登记陈列关系；单件展品的驻留区间不得重叠（端点相接允许）。
+            <b>已被共享照明归属覆盖的驻留不得回改/删除。</b>登录用户只读。</p>
+          <table class="data">
+            <thead><tr><th>#</th><th>展厅标识</th><th>驻留开始</th><th>驻留结束</th><th>状态</th></tr></thead>
+            <tbody id="detail-residence-tbody"></tbody>
+          </table>
+          <form id="residence-form" class="inline-form conservator-only">
+            <span>登记驻留：</span>
+            <input name="hallCode" maxlength="64" placeholder="展厅标识，如 H1" required />
+            <input name="startDate" type="date" required />
+            <input name="startTime" type="time" title="开始时刻（缺省 00:00）" />
+            <span>至</span>
+            <input name="endDate" type="date" required />
+            <input name="endTime" type="time" title="结束时刻（缺省结束日 24:00）" />
+            <button class="primary">登记驻留</button>
+          </form>
+
+          <h4>共享照明（展厅公共照明，永久保留，不可修改/删除）</h4>
+          <p class="muted small">保管员在「共享照明」操作处按<b>展厅标识</b>登记一次<b>已发生</b>的共享照明（起止 + 实际照度 + 必填原因）。
+            系统按与各展品<b>驻留区间的交集</b>归属并跨自然年拆分；计划开灯窗内部分按实际用光替代估算，窗外单独计量；
+            与未作废实测、停灯或已有照明事故相交则整次拒绝。多展品计量与超限处理原子生效，超限仍入账。</p>
+          <table class="data">
+            <thead><tr><th>#</th><th>展厅</th><th>开始</th><th>结束</th><th>实际照度</th><th>原因</th><th>按年实际用光 lx·h（窗内替代 / 窗外单独）</th></tr></thead>
+            <tbody id="detail-shared-tbody"></tbody>
+          </table>
+          <form id="shared-form" class="inline-form conservator-only">
+            <span>登记本展品所在展厅的共享照明：</span>
+            <input name="hallCode" maxlength="64" placeholder="展厅标识，如 H1" required />
+            <input name="startDate" type="date" required />
+            <input name="startTime" type="time" title="开始时刻（缺省 00:00）" />
+            <span>至</span>
+            <input name="endDate" type="date" required />
+            <input name="endTime" type="time" title="结束时刻（缺省结束日 24:00）" />
+            <input name="actualLux" type="number" step="0.01" min="0.01" placeholder="实际照度 lx" required />
+            <input name="reason" maxlength="1000" placeholder="照明原因（必填）" required />
+            <button class="primary">登记共享照明</button>
+          </form>
+          <p class="muted small conservator-only">
+            仅可登记已结束（结束不晚于当前）的照明；无展品驻留交集、与实测/停灯/事故相交时拒绝并指出冲突。
+          </p>
+
           <h4>年度用光账册（封存后不可修改/覆盖）</h4>
           <p class="muted small">保管员可对<b>已结束的自然年</b>封存一份用光账册：原子记录当年上限、已确认实测、
             各计划扣除实测覆盖与停灯后的估算残余、合计及逐项来源（沿用固定时区与现有剂量口径）。

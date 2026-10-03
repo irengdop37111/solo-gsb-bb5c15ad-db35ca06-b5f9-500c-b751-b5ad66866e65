@@ -98,16 +98,25 @@ async function withExhibitTransaction(exhibitId, work) {
  */
 async function withExhibitsTransaction(exhibitIds, work) {
   const ids = [...new Set(exhibitIds.map(Number))].sort((a, b) => a - b);
-  const runLocked = async (idx) => {
-    if (idx >= ids.length) {
-      return withTransaction(async (client) => {
-        for (const exId of ids) {
-          await client.query('SELECT id FROM exhibits WHERE id = $1 FOR UPDATE', [exId]);
-        }
-        return work(client);
-      });
+  const keys = ids.map((id) => `exhibit:${id}`);
+  return withOrderedKeyTransaction(keys, async (client) => {
+    for (const exId of ids) {
+      await client.query('SELECT id FROM exhibits WHERE id = $1 FOR UPDATE', [exId]);
     }
-    return withKeyLock(`exhibit:${ids[idx]}`, () => runLocked(idx + 1));
+    return work(client);
+  });
+}
+
+/**
+ * 按全局键序逐个取得应用层键锁后开事务（用于一次同时涉及展厅与多件展品的操作，
+ * 如共享照明登记、跨展厅驻留修改）。键名统一按字典序加锁，避免跨键事务循环等待；
+ * 调用方应在 work 内按同一顺序对相应行 SELECT ... FOR UPDATE。
+ */
+async function withOrderedKeyTransaction(lockKeys, work) {
+  const keys = [...new Set(lockKeys)].sort();
+  const runLocked = (idx) => {
+    if (idx >= keys.length) return withTransaction(work);
+    return withKeyLock(keys[idx], () => runLocked(idx + 1));
   };
   return runLocked(0);
 }
@@ -116,4 +125,4 @@ async function query(text, params) {
   return pool.query(text, params);
 }
 
-module.exports = { pool, query, withTransaction, withKeyLock, withExhibitTransaction, withExhibitsTransaction };
+module.exports = { pool, query, withTransaction, withKeyLock, withExhibitTransaction, withExhibitsTransaction, withOrderedKeyTransaction };

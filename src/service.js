@@ -269,6 +269,335 @@ async function findOverlappingIncident(client, exhibitId, startMs, endMs, exclud
   return rows[0] || null;
 }
 
+/**
+ * 取同展品与给定区间相交的共享照明归属窗（归属永久保留，无作废状态）。
+ * 返回首条相交归属（含共享照明编号、展厅标识）；后续实测/停灯/事故/纠错碰到共享照明时段一律拒绝。
+ */
+async function findOverlappingSharedLighting(client, exhibitId, startMs, endMs) {
+  const { rows } = await client.query(
+    `SELECT a.id AS allocation_id, a.session_id, a.start_ts, a.end_ts, h.hall_code
+       FROM shared_lighting_allocations a
+       JOIN shared_lightings s ON s.id = a.session_id
+       JOIN halls h ON h.id = s.hall_id
+      WHERE a.exhibit_id = $1
+        AND a.start_ts < $3 AND a.end_ts > $2
+      ORDER BY a.id
+      LIMIT 1`,
+    [exhibitId, new Date(startMs), new Date(endMs)]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * 取同展品与给定区间相交的全部共享照明归属（供一次性列出全部冲突）。
+ * 返回 [{allocationId, sessionId, hallCode, start, end}]（毫秒）。
+ */
+async function findOverlappingSharedLightings(client, exhibitId, startMs, endMs) {
+  const { rows } = await client.query(
+    `SELECT a.id AS allocation_id, a.session_id, a.start_ts, a.end_ts, h.hall_code
+       FROM shared_lighting_allocations a
+       JOIN shared_lightings s ON s.id = a.session_id
+       JOIN halls h ON h.id = s.hall_id
+      WHERE a.exhibit_id = $1
+        AND a.start_ts < $3 AND a.end_ts > $2
+      ORDER BY a.id`,
+    [exhibitId, new Date(startMs), new Date(endMs)]
+  );
+  return rows.map((r) => ({
+    allocationId: Number(r.allocation_id),
+    sessionId: Number(r.session_id),
+    hallCode: r.hall_code,
+    start: new Date(r.start_ts).getTime(),
+    end: new Date(r.end_ts).getTime(),
+  }));
+}
+
+/**
+ * 读取一件展品的全部驻留记录（按开始时刻），附展厅标识。
+ */
+async function getResidenceRows(client, exhibitId) {
+  const { rows } = await client.query(
+    `SELECT r.*, h.hall_code
+       FROM exhibit_residences r JOIN halls h ON h.id = r.hall_id
+      WHERE r.exhibit_id = $1
+      ORDER BY r.start_ts, r.id`,
+    [exhibitId]
+  );
+  return rows;
+}
+
+/**
+ * 构造展品驻留视图：逐条驻留附展厅标识、按年驻留时长，及 covered（是否已被共享照明归属覆盖）。
+ * 已被照明覆盖的驻留不得回改（由修改/删除接口据此拒绝）。
+ */
+async function loadResidenceView(client, exhibitId) {
+  const rows = await getResidenceRows(client, exhibitId);
+  if (rows.length === 0) return { items: [], windows: [] };
+  const ids = rows.map((r) => Number(r.id));
+  const ph = ids.map((_, i) => `$${i + 1}`).join(',');
+  const { rows: covRows } = await client.query(
+    `SELECT DISTINCT residence_id FROM shared_lighting_allocations WHERE residence_id IN (${ph})`,
+    ids
+  );
+  const coveredIds = new Set(covRows.map((r) => Number(r.residence_id)));
+  const windows = [];
+  const items = rows.map((row) => {
+    const seg = { start: new Date(row.start_ts).getTime(), end: new Date(row.end_ts).getTime() };
+    windows.push({ ...seg, id: Number(row.id), hallCode: row.hall_code });
+    return {
+      id: Number(row.id),
+      exhibitId: Number(row.exhibit_id),
+      hallId: Number(row.hall_id),
+      hallCode: row.hall_code,
+      start: tsToWallString(seg.start),
+      end: tsToWallString(seg.end),
+      createdBy: row.created_by,
+      createdAt: row.created_at,
+      covered: coveredIds.has(Number(row.id)),
+    };
+  });
+  return { items, windows };
+}
+
+/**
+ * 按展厅标识读取展厅（不存在返回 null）。
+ */
+async function getHallByCode(client, hallCode) {
+  const { rows } = await client.query('SELECT * FROM halls WHERE hall_code = $1', [hallCode]);
+  return rows[0] || null;
+}
+
+/** 读取展厅（不存在返回 null）。 */
+async function getHallById(client, hallId) {
+  const { rows } = await client.query('SELECT * FROM halls WHERE id = $1', [hallId]);
+  return rows[0] || null;
+}
+
+/**
+ * 取展厅在给定区间内驻留的展品驻留行（与区间相交），用于共享照明归属切分。
+ * 返回行附 hall_code。
+ */
+async function getResidencesIntersecting(client, hallId, startMs, endMs) {
+  const { rows } = await client.query(
+    `SELECT r.*, h.hall_code
+       FROM exhibit_residences r JOIN halls h ON h.id = r.hall_id
+      WHERE r.hall_id = $1
+        AND r.start_ts < $3 AND r.end_ts > $2
+      ORDER BY r.start_ts, r.id`,
+    [hallId, new Date(startMs), new Date(endMs)]
+  );
+  return rows;
+}
+
+/**
+ * 登记驻留（由路由在已持有展品行锁/展厅锁的事务内调用）：
+ *  - 正时长；同展品驻留区间不得重叠（端点相接不算重叠，排除自身 excludeId）。
+ * 返回插入的驻留行。
+ */
+async function registerResidence(client, { exhibitId, hallId, startMs, endMs }, actor) {
+  if (!(endMs > startMs)) throw new ValidationError('驻留结束必须晚于开始');
+  const { rows: clashRows } = await client.query(
+    `SELECT id FROM exhibit_residences
+      WHERE exhibit_id = $1 AND start_ts < $3 AND end_ts > $2
+      ORDER BY id
+      LIMIT 1`,
+    [exhibitId, new Date(startMs), new Date(endMs)]
+  );
+  if (clashRows.length > 0) {
+    throw new ConflictError(
+      `该展品已有驻留 #${clashRows[0].id} 与本驻留区间重叠，单件展品的驻留区间不得重叠`,
+      { overlappingResidenceId: Number(clashRows[0].id) }
+    );
+  }
+  const inserted = await client.query(
+    `INSERT INTO exhibit_residences (exhibit_id, hall_id, start_ts, end_ts, created_by)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [exhibitId, hallId, new Date(startMs), new Date(endMs), actor.userId]
+  );
+  return inserted.rows[0];
+}
+
+/**
+ * 校验并登记一次共享照明（规则 19，由路由在已按序持有展厅锁与各展品行锁的事务内调用）：
+ *  - 起点早于终点、结束不晚于当前时间（只登记已发生照明）、实际照度为正、原因必填（400，
+ *    路由层先行校验，这里防御性复核）；
+ *  - 按与各驻留区间的交集归属各展品并跨自然年拆分；
+ *  - 与任一归属展品的未作废实测（含草稿）、停灯、已有照明事故相交 → 整次拒绝（409，
+ *    details 按展品分组一次性列出全部冲突，不保存）；
+ *  - 无任何展品驻留交集 → 拒绝（409）。
+ * 返回 { session, allocations }；allocations 元素
+ *   { exhibitId, residenceId, start, end（毫秒）, residenceStart, residenceEnd, yearly }。
+ */
+async function registerSharedLighting(client, { hallId, startMs, endMs, actualLux, reason }, actor) {
+  if (!(endMs > startMs)) throw new ValidationError('共享照明起点须早于终点');
+  const nowMs = Date.now();
+  if (endMs > nowMs) {
+    throw new ValidationError(
+      `共享照明结束时刻（${tsToWallString(endMs)}）晚于当前时间，只能登记已发生的照明`
+    );
+  }
+  const reasonText = nonEmptyString(reason, '共享照明原因', 1000);
+  const lux = positiveNumber(actualLux, '共享照明实际照度（lx）', { max: 1000000 });
+
+  const sessionSeg = { start: startMs, end: endMs };
+  const residenceRows = await getResidencesIntersecting(client, hallId, startMs, endMs);
+  if (residenceRows.length === 0) {
+    throw new ValidationError(
+      `共享照明时段 ${tsToWallString(startMs)} ~ ${tsToWallString(endMs)} ` +
+      '与该展厅任何展品的驻留区间都没有交集，无法归属，已拒绝'
+    );
+  }
+
+  // 归属切分：照明窗 ∩ 各驻留区间（端点相接不算）。同一展品驻留互不重叠。
+  const allocations = [];
+  for (const res of residenceRows) {
+    const resSeg = {
+      start: new Date(res.start_ts).getTime(),
+      end: new Date(res.end_ts).getTime(),
+    };
+    const parts = clipIntervalToWindows(sessionSeg, [resSeg]);
+    for (const part of parts) {
+      allocations.push({
+        exhibitId: Number(res.exhibit_id),
+        residenceId: Number(res.id),
+        start: part.start,
+        end: part.end,
+      });
+    }
+  }
+  allocations.sort((a, b) => a.exhibitId - b.exhibitId || a.start - b.start || a.residenceId - b.residenceId);
+
+  // 冲突按展品分组一次性收集：未作废实测（含草稿）、停灯、照明事故
+  const byExhibit = new Map();
+  for (const alloc of allocations) {
+    if (!byExhibit.has(alloc.exhibitId)) byExhibit.set(alloc.exhibitId, []);
+    byExhibit.get(alloc.exhibitId).push(alloc);
+  }
+
+  // 计划标题（冲突消息用）
+  const titleMap = new Map();
+  const conflictsByExhibit = {};
+  const messageParts = [];
+  for (const [exhibitId, allocs] of byExhibit) {
+    const overlappingMeasurements = [];
+    const overlappingBlackouts = [];
+    const overlappingIncidents = [];
+    for (const alloc of allocs) {
+      const { rows: measRows } = await client.query(
+        `SELECT id, plan_id, start_ts, end_ts, status
+           FROM measurements
+          WHERE exhibit_id = $1 AND status <> 'annulled'
+            AND start_ts < $3 AND end_ts > $2
+          ORDER BY id`,
+        [exhibitId, new Date(alloc.start), new Date(alloc.end)]
+      );
+      for (const m of measRows) {
+        overlappingMeasurements.push({
+          id: m.id,
+          planId: m.plan_id,
+          status: m.status,
+          start: tsToWallString(new Date(m.start_ts).getTime()),
+          end: tsToWallString(new Date(m.end_ts).getTime()),
+        });
+      }
+      const { rows: blackoutRows } = await client.query(
+        `SELECT id, plan_id, start_ts, end_ts FROM blackouts
+          WHERE exhibit_id = $1
+            AND start_ts < $3 AND end_ts > $2
+          ORDER BY id`,
+        [exhibitId, new Date(alloc.start), new Date(alloc.end)]
+      );
+      for (const b of blackoutRows) {
+        overlappingBlackouts.push({
+          id: b.id,
+          planId: b.plan_id,
+          start: tsToWallString(new Date(b.start_ts).getTime()),
+          end: tsToWallString(new Date(b.end_ts).getTime()),
+        });
+      }
+      const { rows: incidentRows } = await client.query(
+        `SELECT id, start_ts, end_ts FROM lighting_incidents
+          WHERE exhibit_id = $1
+            AND start_ts < $3 AND end_ts > $2
+          ORDER BY id`,
+        [exhibitId, new Date(alloc.start), new Date(alloc.end)]
+      );
+      for (const x of incidentRows) {
+        overlappingIncidents.push({
+          id: x.id,
+          start: tsToWallString(new Date(x.start_ts).getTime()),
+          end: tsToWallString(new Date(x.end_ts).getTime()),
+        });
+      }
+    }
+    const dedupe = (arr, keyFn) => {
+      const seen = new Set();
+      return arr.filter((x) => {
+        const k = keyFn(x);
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    };
+    const mm = dedupe(overlappingMeasurements, (x) => x.id);
+    const bb = dedupe(overlappingBlackouts, (x) => x.id);
+    const xx = dedupe(overlappingIncidents, (x) => x.id);
+    if (mm.length === 0 && bb.length === 0 && xx.length === 0) continue;
+
+    // 补计划标题
+    for (const b of bb) {
+      if (!titleMap.has(Number(b.planId))) {
+        const t = await client.query('SELECT title FROM plans WHERE id = $1', [b.planId]);
+        titleMap.set(Number(b.planId), t.rows[0] ? t.rows[0].title : null);
+      }
+      b.planTitle = titleMap.get(Number(b.planId)) || null;
+    }
+    conflictsByExhibit[String(exhibitId)] = {
+      exhibitId,
+      overlappingMeasurements: mm,
+      overlappingBlackouts: bb,
+      overlappingIncidents: xx,
+    };
+    for (const m of mm) {
+      messageParts.push(`展品 #${exhibitId}：与${m.status === 'draft' ? '待确认' : '已确认'}` +
+        `实测 #${m.id}（${m.start} ~ ${m.end}）相交`);
+    }
+    for (const b of bb) {
+      messageParts.push(`展品 #${exhibitId}：与停灯记录 #${b.id}（计划「${b.planTitle}」，` +
+        `${b.start} ~ ${b.end}）相交`);
+    }
+    for (const x of xx) {
+      messageParts.push(`展品 #${exhibitId}：与计划外照明事故 #${x.id}（${x.start} ~ ${x.end}）相交`);
+    }
+  }
+
+  if (messageParts.length > 0) {
+    throw new ConflictError(
+      `共享照明登记失败：${messageParts.join('；')}，整次登记未保存`,
+      { conflictsByExhibit }
+    );
+  }
+
+  const inserted = await client.query(
+    `INSERT INTO shared_lightings (hall_id, start_ts, end_ts, actual_lux, reason, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [hallId, new Date(startMs), new Date(endMs), lux, reasonText, actor.userId]
+  );
+  const session = inserted.rows[0];
+  for (const alloc of allocations) {
+    const ins = await client.query(
+      `INSERT INTO shared_lighting_allocations
+         (session_id, residence_id, exhibit_id, start_ts, end_ts, actual_lux)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [session.id, alloc.residenceId, alloc.exhibitId,
+        new Date(alloc.start), new Date(alloc.end), lux]
+    );
+    alloc.id = Number(ins.rows[0].id);
+    alloc.yearly = yearMapToObject(doseByYear([{ start: alloc.start, end: alloc.end }], lux));
+  }
+  return { session, allocations };
+}
+
 /** 读取展品全部计划外照明事故（永久保留），按开始时刻排序。 */
 async function getIncidentRows(client, exhibitId) {
   const { rows } = await client.query(
@@ -338,6 +667,164 @@ async function loadIncidentView(client, exhibitId) {
   return { items, windows };
 }
 
+/** 读取展品全部共享照明归属（永久保留），按归属开始时刻排序。 */
+async function getSharedLightingAllocationRows(client, exhibitId) {
+  // 拆成多条简单查询而非 JOIN —— 个别内存驱动（pg-mem）对多表 JOIN 的实现有缺陷。
+  const { rows: allocRows } = await client.query(
+    `SELECT * FROM shared_lighting_allocations
+      WHERE exhibit_id = $1
+      ORDER BY start_ts, id`,
+    [exhibitId]
+  );
+  if (allocRows.length === 0) return [];
+  const sessionIds = [...new Set(allocRows.map((r) => Number(r.session_id)))];
+  const resIds = [...new Set(allocRows.map((r) => Number(r.residence_id)))];
+  let ph = sessionIds.map((_, i) => `$${i + 1}`).join(',');
+  const { rows: sessionRows } = await client.query(
+    `SELECT s.*, h.hall_code
+       FROM shared_lightings s JOIN halls h ON h.id = s.hall_id
+      WHERE s.id IN (${ph})`,
+    sessionIds
+  );
+  const sessions = new Map(sessionRows.map((s) => [Number(s.id), s]));
+  ph = resIds.map((_, i) => `$${i + 1}`).join(',');
+  const { rows: resRows } = await client.query(
+    `SELECT id, hall_id, start_ts, end_ts FROM exhibit_residences WHERE id IN (${ph})`,
+    resIds
+  );
+  const residences = new Map(resRows.map((r) => [Number(r.id), r]));
+  const userIds = [...new Set(sessionRows.map((s) => s.created_by).filter(Boolean))];
+  const userMap = new Map();
+  if (userIds.length > 0) {
+    const uph = userIds.map((_, i) => `$${i + 1}`).join(',');
+    const { rows: userRows } = await client.query(
+      `SELECT id, display_name FROM users WHERE id IN (${uph})`,
+      userIds
+    );
+    for (const u of userRows) userMap.set(Number(u.id), u.display_name);
+  }
+  return allocRows.map((row) => ({
+    ...row,
+    session: sessions.get(Number(row.session_id)) || null,
+    residence: residences.get(Number(row.residence_id)) || null,
+    creator_name: row.creator_name || null,
+  }));
+}
+
+/**
+ * 构造展品共享照明视图（规则 19）：
+ * 返回 { items, windows }。
+ *  - windows：该展品全部共享照明归属窗 [{start,end,lux,id}]（始终以共享照明实际照度
+ *    全额计入实际用光，供计划残余扣除窗内相交部分）；
+ *  - items：逐条共享照明（按 session 聚合所有归属段），附
+ *      yearly         该次共享照明归属本展品的实际用光按年剂量（始终全额）；
+ *      yearlyInside   与当前已批准/待复核计划开灯窗相交部分（替代计划估算）；
+ *      yearlyOutside  窗外部分（窗外单独计量）；
+ *      insidePlanIds  相交到的计划编号；
+ *      allocations    各归属段（驻留编号、起止、按年剂量）。
+ * 与事故视图同构；驻留/计划变化后窗内/窗外按当前占用计划重算，yearly 不变。
+ */
+async function loadSharedLightingView(client, exhibitId) {
+  const rows = await getSharedLightingAllocationRows(client, exhibitId);
+  if (rows.length === 0) return { items: [], windows: [] };
+
+  const activePlans = await getOccupyingPlans(client, exhibitId);
+  const planWindowList = [];
+  for (const plan of activePlans) {
+    for (const w of planWindows(plan)) {
+      planWindowList.push({ ...w, planId: Number(plan.id) });
+    }
+  }
+
+  const windows = [];
+  const bySession = new Map();
+  for (const row of rows) {
+    const seg = { start: new Date(row.start_ts).getTime(), end: new Date(row.end_ts).getTime() };
+    windows.push({ ...seg, lux: Number(row.actual_lux), id: Number(row.id) });
+    if (!bySession.has(Number(row.session_id))) bySession.set(Number(row.session_id), []);
+    bySession.get(Number(row.session_id)).push({ row, seg });
+  }
+
+  const userIds = [...new Set(
+    [...bySession.values()]
+      .map((group) => group[0].row.session && group[0].row.session.created_by)
+      .filter(Boolean)
+  )];
+  const creatorMap = new Map();
+  if (userIds.length > 0) {
+    const uph = userIds.map((_, i) => `$${i + 1}`).join(',');
+    const { rows: userRows } = await client.query(
+      `SELECT id, display_name FROM users WHERE id IN (${uph})`,
+      userIds
+    );
+    for (const u of userRows) creatorMap.set(Number(u.id), u.display_name);
+  }
+
+  const items = [];
+  for (const [sessionId, group] of bySession) {
+    const first = group[0].row;
+    const session = first.session;
+    const segs = group.map((g) => g.seg);
+    // 同一驻留/不同驻留的归属段互不相交（驻留同展品不重叠）；合并以防端点相邻。
+    const allParts = subtractIntervals(segs, []);
+    const insideParts = clipIntervalToWindowsForPlan(planWindowList, segs.map((s) => ({ ...s })));
+    const outsideParts = subtractIntervals(allParts, insideParts);
+    const insidePlanIds = [...new Set(
+      planWindowList
+        .filter((w) => segs.some((seg) => intersects(w, seg)))
+        .map((w) => w.planId)
+    )].sort((a, b) => a - b);
+    const lux = Number(session ? session.actual_lux : first.actual_lux);
+    items.push({
+      id: sessionId,
+      hallId: session ? Number(session.hall_id) : null,
+      hallCode: session ? session.hall_code : null,
+      exhibitId: Number(first.exhibit_id),
+      start: tsToWallString(new Date(session.start_ts).getTime()),
+      end: tsToWallString(new Date(session.end_ts).getTime()),
+      actualLux: lux,
+      reason: session ? session.reason : null,
+      createdBy: session ? session.created_by : null,
+      creatorName: session && session.created_by
+        ? (creatorMap.get(Number(session.created_by)) || null)
+        : null,
+      createdAt: session ? session.created_at : null,
+      yearly: yearMapToObject(doseByYear(allParts, lux)),
+      yearlyInside: yearMapToObject(doseByYear(insideParts, lux)),
+      yearlyOutside: yearMapToObject(doseByYear(outsideParts, lux)),
+      insidePlanIds,
+      allocations: group
+        .map(({ row, seg }) => ({
+          id: Number(row.id),
+          residenceId: Number(row.residence_id),
+          start: tsToWallString(seg.start),
+          end: tsToWallString(seg.end),
+          actualLux: Number(row.actual_lux),
+          yearly: yearMapToObject(doseByYear([seg], Number(row.actual_lux))),
+        }))
+        .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : a.id - b.id)),
+    });
+  }
+  items.sort((a, b) => (a.start < b.start ? 1 : a.start > b.start ? -1 : b.id - a.id));
+
+  return { items, windows };
+}
+
+/**
+ * 计划在扣除“已确认实测覆盖 + 本计划停灯 + 事故窗内部分 + 共享照明窗内部分”后的估算剂量（按年）。
+ * 统一扣减口径：共享照明与事故一样按自身实际照度全额计入实际用光，此处只把窗内相交部分
+ * 从计划估算中移除（替代估算），窗外部分单独计量，不释放计划排期。
+ */
+function planResidueYearlyWithShared(plan, measWindows, blackoutWindowsByPlan, incidentWindows, sharedWindows) {
+  const windows = planWindows(plan);
+  const coverers = measWindows.filter((mw) => windows.some((w) => intersects(w, mw)));
+  const blackouts = (blackoutWindowsByPlan && blackoutWindowsByPlan.get(Number(plan.id))) || [];
+  const incidents = clipIntervalToWindowsForPlan(windows, incidentWindows);
+  const shared = clipIntervalToWindowsForPlan(windows, sharedWindows);
+  const remaining = subtractIntervals(windows, [...coverers, ...blackouts, ...incidents, ...shared]);
+  return yearMapToObject(doseByYear(remaining, Number(plan.estimated_lux)));
+}
+
 /**
  * 计划在扣除“已确认实测覆盖 + 本计划停灯 + 与计划窗相交的计划外事故”后的估算剂量（按年）。
  * 统一扣减口径：批准/复核、占用查询、调整试算/成对核准、上限下调预演、联合核准均经此或同构逻辑。
@@ -346,12 +833,7 @@ async function loadIncidentView(client, exhibitId) {
  * 窗外部分由 computeOccupancy 单独计量，事故不释放计划排期（计划间开灯窗重叠判定不变）。
  */
 function planResidueYearly(plan, measWindows, blackoutWindowsByPlan, incidentWindows = []) {
-  const windows = planWindows(plan);
-  const coverers = measWindows.filter((mw) => windows.some((w) => intersects(w, mw)));
-  const blackouts = (blackoutWindowsByPlan && blackoutWindowsByPlan.get(Number(plan.id))) || [];
-  const incidents = clipIntervalToWindowsForPlan(windows, incidentWindows);
-  const remaining = subtractIntervals(windows, [...coverers, ...blackouts, ...incidents]);
-  return yearMapToObject(doseByYear(remaining, Number(plan.estimated_lux)));
+  return planResidueYearlyWithShared(plan, measWindows, blackoutWindowsByPlan, incidentWindows, []);
 }
 
 /** 取事故窗与某计划开灯窗的相交部分（合并后区间）。 */
@@ -414,6 +896,9 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
   // 计划外照明事故视图：逐条实际用光 + 全部事故时间窗（供计划残余扣除窗内相交部分）
   const incidentView = await loadIncidentView(client, exhibitId);
 
+  // 共享照明视图：逐条归属实际用光 + 全部归属窗（与事故同口径：窗内替代估算、窗外单独计量）
+  const sharedView = await loadSharedLightingView(client, exhibitId);
+
   const used = {};
   const sources = [];
 
@@ -449,10 +934,31 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
     });
   }
 
-  // 2) 计划的估算残余（开灯窗 − 已确认实测覆盖 − 本计划停灯 − 与计划窗相交的事故部分）
+  // 1c) 共享照明（规则 19）：按与驻留区间的交集归属本展品的实际用光，始终全额计入
+  for (const sh of sharedView.items) {
+    addYearDose(used, sh.yearly);
+    sources.push({
+      kind: 'sharedLighting',
+      id: sh.id,
+      hallCode: sh.hallCode,
+      start: sh.start,
+      end: sh.end,
+      lux: sh.actualLux,
+      reason: sh.reason,
+      yearly: sh.yearly,
+      yearlyInside: sh.yearlyInside,
+      yearlyOutside: sh.yearlyOutside,
+      insidePlanIds: sh.insidePlanIds,
+      allocations: sh.allocations,
+    });
+  }
+
+  // 2) 计划的估算残余
+  //    （开灯窗 − 已确认实测覆盖 − 本计划停灯 − 事故窗内部分 − 共享照明窗内部分）
   for (const plan of plans) {
-    const yearly = planResidueYearly(
-      plan, measWindows, blackoutView.windowsByPlan, incidentView.windows
+    const yearly = planResidueYearlyWithShared(
+      plan, measWindows, blackoutView.windowsByPlan,
+      incidentView.windows, sharedView.windows
     );
     addYearDose(used, yearly);
     sources.push({
@@ -497,6 +1003,8 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
     blackoutDeductionYearly: blackoutView.totalDeductionYearly,
     incidents: incidentView.items,
     incidentWindows: incidentView.windows,
+    sharedLightings: sharedView.items,
+    sharedLightingWindows: sharedView.windows,
   };
 }
 
@@ -580,6 +1088,16 @@ async function validateMeasurementWindow(client, plan, startYmd, startMinute, en
       { overlappingIncidentId: incidentClash.id }
     );
   }
+  const sharedClash = await findOverlappingSharedLighting(client, plan.exhibit_id, start, end);
+  if (sharedClash) {
+    throw new ConflictError(
+      `实测时段与共享照明 #${sharedClash.session_id}（展厅「${sharedClash.hall_code}」，` +
+        `${tsToWallString(new Date(sharedClash.start_ts).getTime())} ~ ` +
+        `${tsToWallString(new Date(sharedClash.end_ts).getTime())}）的归属时段相交，已拒绝；` +
+        '共享照明已按实际用光计量，记录不可修改/删除',
+      { overlappingSharedLightingId: Number(sharedClash.session_id) }
+    );
+  }
   return { start, end, windows };
 }
 
@@ -649,7 +1167,17 @@ async function correctMeasurement(client, originalId, input, actor) {
       ORDER BY id`,
     [plan.exhibit_id, new Date(startMs), new Date(endMs)]
   );
-  if (measRows.length > 0 || blackoutRows.length > 0 || incidentRows.length > 0) {
+  const { rows: sharedClashRows } = await client.query(
+    `SELECT a.id AS allocation_id, a.session_id, a.start_ts, a.end_ts, h.hall_code
+       FROM shared_lighting_allocations a
+       JOIN shared_lightings s ON s.id = a.session_id
+       JOIN halls h ON h.id = s.hall_id
+      WHERE a.exhibit_id = $1
+        AND a.start_ts < $3 AND a.end_ts > $2
+      ORDER BY a.id`,
+    [plan.exhibit_id, new Date(startMs), new Date(endMs)]
+  );
+  if (measRows.length > 0 || blackoutRows.length > 0 || incidentRows.length > 0 || sharedClashRows.length > 0) {
     const planIds = [...new Set(blackoutRows.map((b) => Number(b.plan_id)))];
     const titleMap = new Map();
     if (planIds.length > 0) {
@@ -679,6 +1207,12 @@ async function correctMeasurement(client, originalId, input, actor) {
       start: tsToWallString(new Date(x.start_ts).getTime()),
       end: tsToWallString(new Date(x.end_ts).getTime()),
     }));
+    const overlappingSharedLightings = sharedClashRows.map((x) => ({
+      sessionId: x.session_id,
+      hallCode: x.hall_code,
+      start: tsToWallString(new Date(x.start_ts).getTime()),
+      end: tsToWallString(new Date(x.end_ts).getTime()),
+    }));
     const parts = [];
     for (const m of overlappingMeasurements) {
       parts.push(`与${m.status === 'draft' ? '待确认' : '已确认'}实测 #${m.id}（${m.start} ~ ${m.end}）相交`);
@@ -689,10 +1223,14 @@ async function correctMeasurement(client, originalId, input, actor) {
     for (const x of overlappingIncidents) {
       parts.push(`与计划外照明事故 #${x.id}（${x.start} ~ ${x.end}）相交`);
     }
+    for (const sh of overlappingSharedLightings) {
+      parts.push(`与共享照明 #${sh.sessionId}（展厅「${sh.hallCode}」，${sh.start} ~ ${sh.end}）的归属时段相交`);
+    }
     throw new ConflictError(`实测纠错失败：${parts.join('；')}，未保存`, {
       overlappingMeasurements,
       overlappingBlackouts,
       overlappingIncidents,
+      overlappingSharedLightings,
     });
   }
 
@@ -776,7 +1314,17 @@ async function registerBlackout(client, { planId, startMs, endMs, reason }, acto
       ORDER BY id`,
     [plan.exhibit_id, new Date(startMs), new Date(endMs)]
   );
-  if (measRows.length > 0 || blackoutRows.length > 0 || incidentRows.length > 0) {
+  const { rows: sharedClashRows } = await client.query(
+    `SELECT a.id AS allocation_id, a.session_id, a.start_ts, a.end_ts, h.hall_code
+       FROM shared_lighting_allocations a
+       JOIN shared_lightings s ON s.id = a.session_id
+       JOIN halls h ON h.id = s.hall_id
+      WHERE a.exhibit_id = $1
+        AND a.start_ts < $3 AND a.end_ts > $2
+      ORDER BY a.id`,
+    [plan.exhibit_id, new Date(startMs), new Date(endMs)]
+  );
+  if (measRows.length > 0 || blackoutRows.length > 0 || incidentRows.length > 0 || sharedClashRows.length > 0) {
     // 计划标题单独批量查（避免 JOIN + 时间不等式在个别内存驱动上的实现问题）
     const planIds = [...new Set(blackoutRows.map((b) => Number(b.plan_id)))];
     const titleMap = new Map();
@@ -817,10 +1365,20 @@ async function registerBlackout(client, { planId, startMs, endMs, reason }, acto
     for (const x of overlappingIncidents) {
       parts.push(`与计划外照明事故 #${x.id}（${x.start} ~ ${x.end}）相交`);
     }
+    const overlappingSharedLightings = sharedClashRows.map((x) => ({
+      sessionId: x.session_id,
+      hallCode: x.hall_code,
+      start: tsToWallString(new Date(x.start_ts).getTime()),
+      end: tsToWallString(new Date(x.end_ts).getTime()),
+    }));
+    for (const sh of overlappingSharedLightings) {
+      parts.push(`与共享照明 #${sh.sessionId}（展厅「${sh.hallCode}」，${sh.start} ~ ${sh.end}）的归属时段相交`);
+    }
     throw new ConflictError(`停灯登记失败：${parts.join('；')}，未保存`, {
       overlappingMeasurements,
       overlappingBlackouts,
       overlappingIncidents,
+      overlappingSharedLightings,
     });
   }
 
@@ -877,7 +1435,18 @@ async function registerIncident(client, { exhibitId, startMs, endMs, actualLux, 
       ORDER BY id`,
     [exhibitId, new Date(startMs), new Date(endMs)]
   );
-  if (measRows.length > 0 || blackoutRows.length > 0 || incidentRows.length > 0) {
+  const { rows: sharedClashRowsForIncident } = await client.query(
+    `SELECT a.id AS allocation_id, a.session_id, a.start_ts, a.end_ts, h.hall_code
+       FROM shared_lighting_allocations a
+       JOIN shared_lightings s ON s.id = a.session_id
+       JOIN halls h ON h.id = s.hall_id
+      WHERE a.exhibit_id = $1
+        AND a.start_ts < $3 AND a.end_ts > $2
+      ORDER BY a.id`,
+    [exhibitId, new Date(startMs), new Date(endMs)]
+  );
+  if (measRows.length > 0 || blackoutRows.length > 0 || incidentRows.length > 0 ||
+      sharedClashRowsForIncident.length > 0) {
     const planIds = [...new Set(blackoutRows.map((b) => Number(b.plan_id)))];
     const titleMap = new Map();
     if (planIds.length > 0) {
@@ -917,10 +1486,20 @@ async function registerIncident(client, { exhibitId, startMs, endMs, actualLux, 
     for (const x of overlappingIncidents) {
       parts.push(`与其他计划外照明事故 #${x.id}（${x.start} ~ ${x.end}）相交`);
     }
+    const overlappingSharedLightings = sharedClashRowsForIncident.map((x) => ({
+      sessionId: x.session_id,
+      hallCode: x.hall_code,
+      start: tsToWallString(new Date(x.start_ts).getTime()),
+      end: tsToWallString(new Date(x.end_ts).getTime()),
+    }));
+    for (const sh of overlappingSharedLightings) {
+      parts.push(`与共享照明 #${sh.sessionId}（展厅「${sh.hallCode}」，${sh.start} ~ ${sh.end}）的归属时段相交`);
+    }
     throw new ConflictError(`计划外照明事故登记失败：${parts.join('；')}，未保存`, {
       overlappingMeasurements,
       overlappingBlackouts,
       overlappingIncidents,
+      overlappingSharedLightings,
     });
   }
 
@@ -1050,6 +1629,15 @@ async function evaluateMeasurementBatch(client, plan, rows) {
       ORDER BY id`,
     [exhibitId]
   );
+  const { rows: sharedRowsForBatch } = await client.query(
+    `SELECT a.id AS allocation_id, a.session_id, a.start_ts, a.end_ts, h.hall_code
+       FROM shared_lighting_allocations a
+       JOIN shared_lightings s ON s.id = a.session_id
+       JOIN halls h ON h.id = s.hall_id
+      WHERE a.exhibit_id = $1
+      ORDER BY a.id`,
+    [exhibitId]
+  );
   // 冲突消息中的计划标题（拆简单查询，规避个别内存驱动的 JOIN 缺陷）
   const planIds = [...new Set([
     ...measRows.map((m) => Number(m.plan_id)),
@@ -1083,6 +1671,13 @@ async function evaluateMeasurementBatch(client, plan, rows) {
     start: new Date(x.start_ts).getTime(),
     end: new Date(x.end_ts).getTime(),
   }));
+  const shareds = sharedRowsForBatch.map((x) => ({
+    allocationId: Number(x.allocation_id),
+    sessionId: Number(x.session_id),
+    hallCode: x.hall_code,
+    start: new Date(x.start_ts).getTime(),
+    end: new Date(x.end_ts).getTime(),
+  }));
 
   for (const r of rows) {
     // 解析期错误（字符串）规范化为 {kind:'value'}
@@ -1096,6 +1691,7 @@ async function evaluateMeasurementBatch(client, plan, rows) {
       overlappingMeasurements: [],
       overlappingBlackouts: [],
       overlappingIncidents: [],
+      overlappingSharedLightings: [],
     };
 
     if (!windows.some((w) => containsInterval(w, seg))) {
@@ -1135,6 +1731,16 @@ async function evaluateMeasurementBatch(client, plan, rows) {
         });
       }
     }
+    for (const sh of shareds) {
+      if (sh.start < seg.end && seg.start < sh.end) {
+        conflicts.overlappingSharedLightings.push({
+          sessionId: sh.sessionId,
+          hallCode: sh.hallCode,
+          start: tsToWallString(sh.start),
+          end: tsToWallString(sh.end),
+        });
+      }
+    }
     for (const c of conflicts.overlappingMeasurements) {
       r.errors.push({
         kind: 'overlap',
@@ -1151,6 +1757,12 @@ async function evaluateMeasurementBatch(client, plan, rows) {
       r.errors.push({
         kind: 'overlap',
         message: `与计划外照明事故 #${c.id}（${c.start} ~ ${c.end}）相交`,
+      });
+    }
+    for (const c of conflicts.overlappingSharedLightings) {
+      r.errors.push({
+        kind: 'overlap',
+        message: `与共享照明 #${c.sessionId}（展厅「${c.hallCode}」，${c.start} ~ ${c.end}）的归属时段相交`,
       });
     }
     r.conflicts = conflicts;
@@ -1365,6 +1977,9 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
   // 计划外照明事故：与拟改窗相交部分同样以事故实际用光替代估算（窗外部分已单独计量，不释放排期）
   const incidentView = await loadIncidentView(client, plan.exhibit_id);
   const incidentsInNew = clipIntervalToWindowsForPlan(targetWindows, incidentView.windows);
+  // 共享照明归属：与拟改窗相交部分同样以共享照明实际用光替代估算
+  const sharedView = await loadSharedLightingView(client, plan.exhibit_id);
+  const sharedInNew = clipIntervalToWindowsForPlan(targetWindows, sharedView.windows);
 
   // 2) 与同展品其他已批准/待复核计划的开灯时刻重叠
   const others = await getOccupyingPlans(client, plan.exhibit_id, plan.id);
@@ -1386,9 +2001,10 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
   const coverers = confirmedMeas
     .map((m) => ({ start: new Date(m.start_ts).getTime(), end: new Date(m.end_ts).getTime() }))
     .filter((mw) => targetWindows.some((w) => intersects(w, mw)));
-  // 新残余 = 新窗 − 已确认实测覆盖 − 落在新窗内的本计划停灯 − 与新窗相交的事故部分（统一口径）
+  // 新残余 = 新窗 − 已确认实测覆盖 − 落在新窗内的本计划停灯 − 与新窗相交的事故部分
+  //        − 与新窗相交的共享照明归属部分（统一口径）
   const newRemaining = subtractIntervals(
-    targetWindows, [...coverers, ...ownBlackoutsInNew, ...incidentsInNew]
+    targetWindows, [...coverers, ...ownBlackoutsInNew, ...incidentsInNew, ...sharedInNew]
   );
   const newResidueYearly = yearMapToObject(doseByYear(newRemaining, Number(adjInput.estimated_lux)));
 
@@ -1408,12 +2024,14 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
     for (const part of clipIntervalToWindows(hole, oldWindows)) ownBlackoutsInOld.push(part);
   }
   const incidentsInOld = clipIntervalToWindowsForPlan(oldWindows, incidentView.windows);
+  const sharedInOld = clipIntervalToWindowsForPlan(oldWindows, sharedView.windows);
   const oldRemaining = subtractIntervals(
     oldWindows,
     [
       ...allMeasWindows.filter((mw) => oldWindows.some((w) => intersects(w, mw))),
       ...ownBlackoutsInOld,
       ...incidentsInOld,
+      ...sharedInOld,
     ]
   );
   const oldResidue = yearMapToObject(doseByYear(oldRemaining, Number(plan.estimated_lux)));
@@ -1596,6 +2214,8 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
   }));
   // 计划外事故：与计划窗相交部分替代估算（两条计划共用同展品事故视图）
   const incidentView = await loadIncidentView(client, planA.exhibit_id);
+  // 共享照明归属：同展品同一视图，与事故同口径替代估算
+  const sharedView = await loadSharedLightingView(client, planA.exhibit_id);
 
   const items = [];
   for (const { plan, adj, windows } of pair) {
@@ -1612,7 +2232,7 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
       return out;
     };
 
-    // 原残余：原窗扣除本展品全部已确认实测覆盖、本计划停灯与事故窗内部分（与 computeOccupancy 口径一致）
+    // 原残余：原窗扣除本展品全部已确认实测覆盖、本计划停灯、事故与共享照明窗内部分（与 computeOccupancy 口径一致）
     const oldWindows = planWindows(plan);
     const oldRemaining = subtractIntervals(
       oldWindows,
@@ -1620,6 +2240,7 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
         ...allMeasWindows.filter((mw) => oldWindows.some((w) => intersects(w, mw))),
         ...clipHoles(oldWindows),
         ...clipIntervalToWindowsForPlan(oldWindows, incidentView.windows),
+        ...clipIntervalToWindowsForPlan(oldWindows, sharedView.windows),
       ]
     );
     const oldResidueYearly = yearMapToObject(doseByYear(oldRemaining, Number(plan.estimated_lux)));
@@ -1632,7 +2253,12 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
       .filter((mw) => windows.some((w) => intersects(w, mw)));
     const newRemaining = subtractIntervals(
       windows,
-      [...confirmedOwn, ...clipHoles(windows), ...clipIntervalToWindowsForPlan(windows, incidentView.windows)]
+      [
+        ...confirmedOwn,
+        ...clipHoles(windows),
+        ...clipIntervalToWindowsForPlan(windows, incidentView.windows),
+        ...clipIntervalToWindowsForPlan(windows, sharedView.windows),
+      ]
     );
     const newResidueYearly = yearMapToObject(doseByYear(newRemaining, Number(adj.estimated_lux)));
 
@@ -1928,6 +2554,33 @@ async function computeLimitPreview(client, exhibitId, year, proposedLimit, { now
     insidePlanIds: x.insidePlanIds,
   }));
 
+  // 共享照明归属始终计入实际用光：新增/变化同样须使旧预演凭证失效
+  const sharedLightingDoses = (occupancy.sharedLightings || [])
+    .filter((x) => (x.yearly[yearStr] || 0) > 0)
+    .map((x) => ({
+      id: x.id,
+      hallCode: x.hallCode,
+      start: x.start,
+      end: x.end,
+      lux: x.actualLux,
+      yearDose: round3(x.yearly[yearStr]),
+      yearInside: round3(x.yearlyInside[yearStr] || 0),
+      yearOutside: round3(x.yearlyOutside[yearStr] || 0),
+      insidePlanIds: x.insidePlanIds,
+      reason: x.reason,
+    }));
+  const fingerprintSharedLightings = (occupancy.sharedLightings || []).map((x) => ({
+    id: x.id,
+    hallCode: x.hallCode,
+    start: x.start,
+    end: x.end,
+    lux: x.actualLux,
+    yearly: x.yearly,
+    yearlyInside: x.yearlyInside,
+    yearlyOutside: x.yearlyOutside,
+    insidePlanIds: x.insidePlanIds,
+  }));
+
   return {
     exhibitId,
     year,
@@ -1939,6 +2592,7 @@ async function computeLimitPreview(client, exhibitId, year, proposedLimit, { now
     over: excess > 0,
     confirmedMeasurements,
     incidents: incidentDoses,
+    sharedLightings: sharedLightingDoses,
     planResidues,
     blackoutDeductions,
     flagCandidates,
@@ -1949,6 +2603,7 @@ async function computeLimitPreview(client, exhibitId, year, proposedLimit, { now
       plans: fingerprintPlans,
       blackouts: fingerprintBlackouts,
       incidents: fingerprintIncidents,
+      sharedLightings: fingerprintSharedLightings,
       startedPlanIds,
     },
   };
@@ -2051,7 +2706,8 @@ async function evaluatePlanBatch(client, orderedPlans, nowMs = Date.now()) {
     }));
     const blackoutView = await loadBlackoutView(client, exId, { confirmedRows: measurements });
     const incidentView = await loadIncidentView(client, exId);
-    occByExhibit.set(exId, { occupancy, occPlans, measWindows, blackoutView, incidentView });
+    const sharedView = await loadSharedLightingView(client, exId);
+    occByExhibit.set(exId, { occupancy, occPlans, measWindows, blackoutView, incidentView, sharedView });
   }
 
   // 3) 每条计划不与同展品其他已批准/待复核计划重叠
@@ -2080,7 +2736,7 @@ async function evaluatePlanBatch(client, orderedPlans, nowMs = Date.now()) {
   const items = [];
   const exhibitsReport = [];
   for (const [exId, group] of byExhibit) {
-    const { occupancy, measWindows, blackoutView, incidentView } = occByExhibit.get(exId);
+    const { occupancy, measWindows, blackoutView, incidentView, sharedView } = occByExhibit.get(exId);
     // 不含组内计划的当前占用（组内均为 submitted，occupancy.used 即“原占用”，防御性重算）
     const usedByOthers = {};
     for (const src of occupancy.sources) {
@@ -2095,7 +2751,10 @@ async function evaluatePlanBatch(client, orderedPlans, nowMs = Date.now()) {
       const coverers = measWindows.filter((mw) => windows.some((w) => intersects(w, mw)));
       const blackouts = blackoutView.windowsByPlan.get(Number(plan.id)) || [];
       const incidents = clipIntervalToWindowsForPlan(windows, incidentView.windows);
-      const remaining = subtractIntervals(windows, [...coverers, ...blackouts, ...incidents]);
+      const shared = clipIntervalToWindowsForPlan(windows, sharedView.windows);
+      const remaining = subtractIntervals(windows, [
+        ...coverers, ...blackouts, ...incidents, ...shared,
+      ]);
       const residueYearly = yearMapToObject(doseByYear(remaining, Number(plan.estimated_lux)));
       addYearDose(groupResidueYearly, residueYearly);
       return { plan, windows, grossYearly, residueYearly };
@@ -2268,6 +2927,19 @@ module.exports = {
   registerBlackout,
   registerIncident,
   clipIntervalToWindowsForPlan,
+  // 展厅驻留 / 共享照明（规则 19）
+  getHallByCode,
+  getHallById,
+  getResidenceRows,
+  loadResidenceView,
+  getResidencesIntersecting,
+  registerResidence,
+  getSharedLightingAllocationRows,
+  loadSharedLightingView,
+  registerSharedLighting,
+  findOverlappingSharedLighting,
+  findOverlappingSharedLightings,
+  planResidueYearlyWithShared,
   computeOccupancy,
   buildOverflows,
   planOverlaps,
